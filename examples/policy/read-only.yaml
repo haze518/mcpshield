@@ -1,0 +1,42 @@
+# read-only.yaml — allow read-only access across common MCP tools.
+# Replace tool names with those from your actual upstream servers.
+
+version: "1"
+
+toolsets:
+  github_read:
+    tools:
+      - github.get_file_contents
+      - github.search_repositories
+      - github.list_issues
+      - github.get_issue
+      - github.list_pull_requests
+
+  filesystem_read:
+    tools:
+      - filesystem.read_file
+      - filesystem.list_directory
+      - filesystem.get_file_info
+
+rules:
+  - name: allow-github-read
+    action: allow
+    toolset: github_read
+    rate_limit:
+      max: 60
+      window: "1m"
+      per: client
+
+  - name: allow-filesystem-read
+    action: allow
+    toolset: filesystem_read
+
+  - name: block-sensitive-paths
+    action: deny
+    tools:
+      - filesystem.read_file
+      - filesystem.list_directory
+    args:
+      path:
+        not_match: "^/etc/|^/root/|\\.\\./|\\.ssh"
+    reason: "Sensitive path access blocked"

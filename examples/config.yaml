@@ -1,0 +1,23 @@
+# MCPShield demo configuration — used by docker-compose.yaml.
+# auth.type: none means all requests are accepted (suitable for local demo only).
+# See README.md for API key setup.
+
+server:
+  listen: ":8080"
+
+auth:
+  type: none  # change to "api_key" and add keys for production use
+
+policy_file: /etc/mcpshield/policy.yaml
+
+upstreams:
+  - id: mock
+    prefix: mock
+    url: http://mock-upstream:9090
+
+observability:
+  metrics:
+    enabled: true
+
+audit:
+  enabled: false  # set to true with backend: sqlite for production audit logging

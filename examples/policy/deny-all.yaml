@@ -1,0 +1,11 @@
+# deny-all.yaml — explicitly deny every tool call.
+#
+# MCPShield defaults to deny-all even without a policy file.
+# This file makes the intent explicit and is useful for:
+#   - testing that deny-all is correctly enforced
+#   - staging environments where access has not yet been reviewed
+#   - auditing tool calls without granting any access
+
+version: "1"
+
+rules: []

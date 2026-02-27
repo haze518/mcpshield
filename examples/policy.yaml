@@ -1,0 +1,16 @@
+# MCPShield demo policy — used by docker-compose.yaml.
+# Allows the two tools exposed by the mock-upstream.
+# All other tools are denied by default.
+
+version: "1"
+
+rules:
+  - name: allow-echo
+    action: allow
+    tools:
+      - mock.echo
+
+  - name: allow-time
+    action: allow
+    tools:
+      - mock.time.now

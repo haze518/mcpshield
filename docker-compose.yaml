@@ -1,0 +1,29 @@
+services:
+
+  # Minimal MCP server: exposes tools "echo" and "time.now"
+  mock-upstream:
+    build:
+      context: .
+      dockerfile: examples/mock-upstream/Dockerfile
+    ports:
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # MCPShield gateway: enforces policy before forwarding to mock-upstream
+  mcpshield:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./examples/config.yaml:/etc/mcpshield/config.yaml:ro
+      - ./examples/policy.yaml:/etc/mcpshield/policy.yaml:ro
+    depends_on:
+      mock-upstream:
+        condition: service_healthy

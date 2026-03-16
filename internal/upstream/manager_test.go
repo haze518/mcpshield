@@ -17,6 +17,38 @@ import (
 	"github.com/haze518/mcpshield/internal/upstream"
 )
 
+func defaultClientConfig() transport.MCPHTTPClientConfig {
+	return transport.MCPHTTPClientConfig{
+		RequestTimeout:   30 * time.Second,
+		MaxResponseBytes: 4 << 20,
+	}
+}
+
+func defaultManagerConfig() upstream.ManagerConfig {
+	return upstream.ManagerConfig{
+		ToolsCacheTTL:  10 * time.Second,
+		RefreshTimeout: 30 * time.Second,
+	}
+}
+
+func mustClient(t *testing.T, id, url string) *transport.MCPHTTPClient {
+	t.Helper()
+	client, err := transport.NewMCPHTTPClient(id, url, nil, defaultClientConfig())
+	if err != nil {
+		t.Fatalf("NewMCPHTTPClient: %v", err)
+	}
+	return client
+}
+
+func mustManager(t *testing.T, entries []upstream.Entry) upstream.Manager {
+	t.Helper()
+	mgr, err := upstream.NewManager(context.Background(), entries, defaultManagerConfig())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	return mgr
+}
+
 func newFakeMCPServer(t *testing.T, tools []mcp.Tool) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -68,8 +100,8 @@ func TestToolsListReturnsPrefixedNames(t *testing.T) {
 	})
 	defer srv.Close()
 
-	client := transport.NewMCPHTTPClient("fs", srv.URL, nil)
-	mgr := upstream.NewManager(context.Background(), []upstream.Entry{
+	client := mustClient(t, "fs", srv.URL)
+	mgr := mustManager(t, []upstream.Entry{
 		{ID: "fs", Prefix: "fs", Client: client},
 	})
 
@@ -102,8 +134,8 @@ func TestToolsCallRoutesAndStripsPrefix(t *testing.T) {
 	})
 	defer srv.Close()
 
-	client := transport.NewMCPHTTPClient("fs", srv.URL, nil)
-	mgr := upstream.NewManager(context.Background(), []upstream.Entry{
+	client := mustClient(t, "fs", srv.URL)
+	mgr := mustManager(t, []upstream.Entry{
 		{ID: "fs", Prefix: "fs", Client: client},
 	})
 
@@ -135,8 +167,8 @@ func TestToolsCallUnknownToolReturnsError(t *testing.T) {
 	})
 	defer srv.Close()
 
-	client := transport.NewMCPHTTPClient("fs", srv.URL, nil)
-	mgr := upstream.NewManager(context.Background(), []upstream.Entry{
+	client := mustClient(t, "fs", srv.URL)
+	mgr := mustManager(t, []upstream.Entry{
 		{ID: "fs", Prefix: "fs", Client: client},
 	})
 
@@ -165,9 +197,9 @@ func TestToolsListMultipleUpstreams(t *testing.T) {
 	})
 	defer srv2.Close()
 
-	mgr := upstream.NewManager(context.Background(), []upstream.Entry{
-		{ID: "fs", Prefix: "fs", Client: transport.NewMCPHTTPClient("fs", srv1.URL, nil)},
-		{ID: "gh", Prefix: "gh", Client: transport.NewMCPHTTPClient("gh", srv2.URL, nil)},
+	mgr := mustManager(t, []upstream.Entry{
+		{ID: "fs", Prefix: "fs", Client: mustClient(t, "fs", srv1.URL)},
+		{ID: "gh", Prefix: "gh", Client: mustClient(t, "gh", srv2.URL)},
 	})
 
 	if err := mgr.Warmup(context.Background()); err != nil {
@@ -243,9 +275,12 @@ func TestWarmupTransitionsManagerToReady(t *testing.T) {
 	}
 	close(client.releaseC)
 
-	mgr := upstream.NewManager(context.Background(), []upstream.Entry{
+	mgr, err := upstream.NewManager(context.Background(), []upstream.Entry{
 		{ID: "test", Prefix: "p", Client: client},
-	})
+	}, defaultManagerConfig())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
 	if mgr.Ready() {
 		t.Fatal("manager must start unready")
 	}
@@ -259,9 +294,12 @@ func TestWarmupTransitionsManagerToReady(t *testing.T) {
 
 func TestWarmupFailureLeavesManagerUnready(t *testing.T) {
 	client := &fakeCountClient{tools: []mcp.Tool{{Name: "tool1"}}, failAfter: 0}
-	mgr := upstream.NewManager(context.Background(), []upstream.Entry{
+	mgr, err := upstream.NewManager(context.Background(), []upstream.Entry{
 		{ID: "test", Prefix: "p", Client: client},
-	})
+	}, defaultManagerConfig())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
 	if err := mgr.Warmup(context.Background()); err == nil {
 		t.Fatal("expected Warmup to fail")
 	}
@@ -272,9 +310,12 @@ func TestWarmupFailureLeavesManagerUnready(t *testing.T) {
 
 func TestErrNotReadyReturnedBeforeSuccessfulWarmup(t *testing.T) {
 	client := &fakeCountClient{tools: []mcp.Tool{{Name: "tool1"}}, failAfter: 1}
-	mgr := upstream.NewManager(context.Background(), []upstream.Entry{
+	mgr, err := upstream.NewManager(context.Background(), []upstream.Entry{
 		{ID: "test", Prefix: "p", Client: client},
-	})
+	}, defaultManagerConfig())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
 	_, err := mgr.ToolsList(context.Background())
 	if !errors.Is(err, upstream.ErrNotReady) {
 		t.Fatalf("expected ErrNotReady, got %v", err)
@@ -308,9 +349,12 @@ func TestWarmupRetryAfterFailureEventuallyReady(t *testing.T) {
 		failures: 1,
 		tools:    []mcp.Tool{{Name: "tool1", Description: "desc"}},
 	}
-	mgr := upstream.NewManager(context.Background(), []upstream.Entry{
+	mgr, err := upstream.NewManager(context.Background(), []upstream.Entry{
 		{ID: "test", Prefix: "p", Client: client},
-	})
+	}, defaultManagerConfig())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
 	if err := mgr.Warmup(context.Background()); err == nil {
 		t.Fatal("first Warmup should fail")
 	}
@@ -368,9 +412,12 @@ func TestInvalidateCacheResetsReadiness(t *testing.T) {
 		releaseC: make(chan struct{}),
 	}
 	close(client.releaseC)
-	mgr := upstream.NewManager(context.Background(), []upstream.Entry{
+	mgr, err := upstream.NewManager(context.Background(), []upstream.Entry{
 		{ID: "test", Prefix: "p", Client: client},
-	})
+	}, defaultManagerConfig())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
 	if err := mgr.Warmup(context.Background()); err != nil {
 		t.Fatalf("Warmup: %v", err)
 	}
@@ -394,9 +441,12 @@ func TestWarmupAfterInvalidateRestoresReadiness(t *testing.T) {
 		releaseC: make(chan struct{}),
 	}
 	close(client.releaseC)
-	mgr := upstream.NewManager(context.Background(), []upstream.Entry{
+	mgr, err := upstream.NewManager(context.Background(), []upstream.Entry{
 		{ID: "test", Prefix: "p", Client: client},
-	})
+	}, defaultManagerConfig())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
 	if err := mgr.Warmup(context.Background()); err != nil {
 		t.Fatalf("Warmup: %v", err)
 	}
@@ -409,6 +459,80 @@ func TestWarmupAfterInvalidateRestoresReadiness(t *testing.T) {
 	}
 	if !mgr.Ready() {
 		t.Fatal("manager must be ready again after successful warmup")
+	}
+}
+
+func TestConfiguredRefreshTimeoutIsUsedInBackgroundRefresh(t *testing.T) {
+	client := &blockingClient{
+		tools:    []mcp.Tool{{Name: "tool1", Description: "desc"}},
+		blockAt:  2,
+		releaseC: make(chan struct{}),
+	}
+	mgr := upstream.NewManagerWithConfig(context.Background(), []upstream.Entry{
+		{ID: "test", Prefix: "p", Client: client},
+	}, upstream.ManagerConfig{
+		ToolsCacheTTL:  5 * time.Millisecond,
+		RefreshTimeout: 20 * time.Millisecond,
+	})
+
+	if err := mgr.Warmup(context.Background()); err != nil {
+		t.Fatalf("Warmup: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	if _, err := mgr.ToolsList(context.Background()); err != nil {
+		t.Fatalf("stale ToolsList: %v", err)
+	}
+	for i := 0; i < 100; i++ {
+		if !mgr.BgRefreshInProgress() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("background refresh should stop after configured refresh timeout")
+}
+
+func TestConfiguredToolsCacheTTLControlsStaleRefresh(t *testing.T) {
+	releaseC := make(chan struct{})
+	client := &blockingClient{
+		tools:    []mcp.Tool{{Name: "tool1", Description: "desc"}},
+		blockAt:  2,
+		releaseC: releaseC,
+	}
+	mgr := upstream.NewManagerWithConfig(context.Background(), []upstream.Entry{
+		{ID: "test", Prefix: "p", Client: client},
+	}, upstream.ManagerConfig{
+		ToolsCacheTTL:  5 * time.Millisecond,
+		RefreshTimeout: 30 * time.Second,
+	})
+
+	if err := mgr.Warmup(context.Background()); err != nil {
+		t.Fatalf("Warmup: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	got, err := mgr.ToolsList(context.Background())
+	if err != nil {
+		t.Fatalf("ToolsList: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected stale cached tool, got %v", got)
+	}
+
+	for i := 0; i < 100; i++ {
+		if mgr.BgRefreshInProgress() {
+			close(releaseC)
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("expired cache should trigger background refresh using configured tools cache TTL")
+}
+
+func TestNewManagerRejectsInvalidConfig(t *testing.T) {
+	_, err := upstream.NewManager(context.Background(), nil, upstream.ManagerConfig{})
+	if err == nil {
+		t.Fatal("expected invalid manager config to be rejected")
 	}
 }
 

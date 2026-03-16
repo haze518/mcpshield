@@ -13,13 +13,16 @@ import (
 	"github.com/haze518/mcpshield/internal/mcp"
 )
 
-const defaultMaxResponseBytes = 4 << 20 // 4 MiB
-
 // UpstreamMetrics is satisfied by observability.Registry.
 // Defining the interface here avoids an import cycle between transport and observability.
 type UpstreamMetrics interface {
 	IncUpstreamProtocolError(upstreamID string)
 	IncUpstreamResponseTooLarge(upstreamID string)
+}
+
+type MCPHTTPClientConfig struct {
+	RequestTimeout   time.Duration
+	MaxResponseBytes int64
 }
 
 // MCPHTTPClient makes JSON-RPC 2.0 calls to a single upstream MCP server
@@ -34,14 +37,29 @@ type MCPHTTPClient struct {
 	metrics          UpstreamMetrics
 }
 
-func NewMCPHTTPClient(upstreamID, baseURL string, headers map[string]string) *MCPHTTPClient {
+// NewMCPHTTPClient expects normalized transport limits/timeouts; invalid
+// zero/negative values are rejected.
+func NewMCPHTTPClient(upstreamID, baseURL string, headers map[string]string, cfg MCPHTTPClientConfig) (*MCPHTTPClient, error) {
+	if err := validateMCPHTTPClientConfig(cfg); err != nil {
+		return nil, err
+	}
 	return &MCPHTTPClient{
 		upstreamID:       upstreamID,
 		baseURL:          baseURL,
 		headers:          headers,
-		httpClient:       &http.Client{Timeout: 30 * time.Second},
-		maxResponseBytes: defaultMaxResponseBytes,
+		httpClient:       &http.Client{Timeout: cfg.RequestTimeout},
+		maxResponseBytes: cfg.MaxResponseBytes,
+	}, nil
+}
+
+func validateMCPHTTPClientConfig(cfg MCPHTTPClientConfig) error {
+	if cfg.RequestTimeout <= 0 {
+		return fmt.Errorf("transport MCP client request timeout must be > 0")
 	}
+	if cfg.MaxResponseBytes <= 0 {
+		return fmt.Errorf("transport MCP client max response bytes must be > 0")
+	}
+	return nil
 }
 
 // SetMetrics wires optional upstream metrics into the client.

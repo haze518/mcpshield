@@ -10,11 +10,22 @@ import (
 // NewManagerWithTTL creates a realManager with a custom cache TTL.
 // Used by upstream_test to control cache expiry in unit tests.
 func NewManagerWithTTL(ctx context.Context, entries []Entry, ttl time.Duration) *realManager {
-	return &realManager{
-		ctx:      ctx,
-		entries:  entries,
-		cacheTTL: ttl,
+	mgr, err := NewManager(ctx, entries, ManagerConfig{
+		ToolsCacheTTL:  ttl,
+		RefreshTimeout: 30 * time.Second,
+	})
+	if err != nil {
+		panic(err)
 	}
+	return mgr
+}
+
+func NewManagerWithConfig(ctx context.Context, entries []Entry, cfg ManagerConfig) *realManager {
+	mgr, err := NewManager(ctx, entries, cfg)
+	if err != nil {
+		panic(err)
+	}
+	return mgr
 }
 
 // BgRefreshInProgress reports whether a background cache refresh goroutine

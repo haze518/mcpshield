@@ -23,8 +23,6 @@ import (
 	"github.com/haze518/mcpshield/pkg/config"
 )
 
-const warmupRetryInterval = 5 * time.Second
-
 func main() {
 	if err := rootCmd().Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -61,16 +59,23 @@ func serveCmd() *cobra.Command {
 	return cmd
 }
 
-func buildEntries(cfg *config.Config) []upstream.Entry {
-	entries := make([]upstream.Entry, 0, len(cfg.Upstreams))
-	for _, u := range cfg.Upstreams {
+func buildEntries(upstreamsCfg []config.UpstreamRuntimeConfig) ([]upstream.Entry, error) {
+	entries := make([]upstream.Entry, 0, len(upstreamsCfg))
+	for _, u := range upstreamsCfg {
+		client, err := transport.NewMCPHTTPClient(u.ID, u.URL, u.Headers, transport.MCPHTTPClientConfig{
+			RequestTimeout:   u.RequestTimeout,
+			MaxResponseBytes: u.MaxResponseBytes,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("init upstream client %q: %w", u.ID, err)
+		}
 		entries = append(entries, upstream.Entry{
 			ID:     u.ID,
 			Prefix: u.Prefix,
-			Client: transport.NewMCPHTTPClient(u.ID, u.URL, u.Headers),
+			Client: client,
 		})
 	}
-	return entries
+	return entries, nil
 }
 
 // buildAuth constructs the Authenticator from config.
@@ -110,6 +115,10 @@ func runServe(ctx context.Context, cfgPath string) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
+	}
+	runtimeCfg, err := cfg.BuildRuntime()
+	if err != nil {
+		return fmt.Errorf("build runtime config: %w", err)
 	}
 
 	// Build authenticator.
@@ -152,46 +161,38 @@ func runServe(ctx context.Context, cfgPath string) error {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	entries := buildEntries(cfg)
-	mgr := upstream.NewManager(ctx, entries)
+	entries, err := buildEntries(runtimeCfg.Upstreams)
+	if err != nil {
+		return err
+	}
+	mgr, err := upstream.NewManager(ctx, entries, upstream.ManagerConfig{
+		ToolsCacheTTL:  runtimeCfg.UpstreamManager.ToolsCacheTTL,
+		RefreshTimeout: runtimeCfg.UpstreamManager.RefreshTimeout,
+	})
+	if err != nil {
+		return fmt.Errorf("init upstream manager: %w", err)
+	}
 
-	gw := gateway.New(
+	gw, err := gateway.New(
 		authenticator,
 		policyEngine,
 		mgr,
 		auditLog,
+		gateway.Config{
+			RequestTimeout:    runtimeCfg.Server.RequestTimeout,
+			MaxRequestBytes:   runtimeCfg.Server.MaxRequestBytes,
+			SessionTTL:        runtimeCfg.Server.SessionTTL,
+			SessionMaxEntries: runtimeCfg.Server.SessionMaxEntries,
+		},
 	)
-
-	sessionTTL := 30 * time.Minute
-	if cfg.Server.SessionTTL != "" {
-		ttl, err := time.ParseDuration(cfg.Server.SessionTTL)
-		if err != nil {
-			return fmt.Errorf("parse server.session_ttl: %w", err)
-		}
-		sessionTTL = ttl
-	}
-	sessionMaxEntries := 10_000
-	if cfg.Server.SessionMaxEntries != nil {
-		sessionMaxEntries = *cfg.Server.SessionMaxEntries
-	}
-	gw.SetSessionConfig(sessionTTL, sessionMaxEntries)
-	retryInterval := warmupRetryInterval
-	if cfg.Server.WarmupRetryInterval != "" {
-		d, err := time.ParseDuration(cfg.Server.WarmupRetryInterval)
-		if err != nil {
-			return fmt.Errorf("parse server.warmup_retry_interval: %w", err)
-		}
-		retryInterval = d
+	if err != nil {
+		return fmt.Errorf("init gateway: %w", err)
 	}
 	log.Info("session cache configured",
-		slog.Duration("ttl", sessionTTL),
-		slog.Int("max_entries", sessionMaxEntries))
+		slog.Duration("ttl", runtimeCfg.Server.SessionTTL),
+		slog.Int("max_entries", runtimeCfg.Server.SessionMaxEntries))
 	log.Info("HTTP session cache is in-memory; process restart requires clients to re-initialize")
-
-	if cfg.Server.MaxRequestBytes > 0 {
-		gw.SetMaxRequestBytes(cfg.Server.MaxRequestBytes)
-		log.Info("request body limit", slog.Int64("bytes", cfg.Server.MaxRequestBytes))
-	}
+	log.Info("request body limit", slog.Int64("bytes", runtimeCfg.Server.MaxRequestBytes))
 
 	if cfg.Observability.Metrics.Enabled {
 		reg := observability.NewRegistry(cfg.Observability.Metrics.IncludeClientID)
@@ -210,7 +211,14 @@ func runServe(ctx context.Context, cfgPath string) error {
 		log.Info("metrics enabled", slog.String("path", "/metrics"))
 	}
 
-	srv := transport.NewHTTPServer(cfg.Server.Listen, gw)
+	srv, err := transport.NewHTTPServer(runtimeCfg.Server.Listen, gw, transport.HTTPServerConfig{
+		ReadTimeout:  runtimeCfg.Server.ReadTimeout,
+		WriteTimeout: runtimeCfg.Server.WriteTimeout,
+		IdleTimeout:  runtimeCfg.Server.IdleTimeout,
+	})
+	if err != nil {
+		return fmt.Errorf("init HTTP server: %w", err)
+	}
 
 	// SIGHUP: hot-reload policy without restart.
 	sighupCh := make(chan os.Signal, 1)
@@ -235,13 +243,13 @@ func runServe(ctx context.Context, cfgPath string) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Info("server starting", slog.String("addr", cfg.Server.Listen))
+		log.Info("server starting", slog.String("addr", runtimeCfg.Server.Listen))
 		if err := srv.ListenAndServe(); err != nil {
 			errCh <- err
 		}
 	}()
 
-	go runWarmupUntilReady(ctx, mgr, retryInterval, log)
+	go runWarmupUntilReady(ctx, mgr, runtimeCfg.Server.WarmupTimeout, runtimeCfg.Server.WarmupRetryInterval, log)
 
 	select {
 	case <-ctx.Done():
@@ -256,10 +264,7 @@ func runServe(ctx context.Context, cfgPath string) error {
 func runWarmupUntilReady(ctx context.Context, mgr interface {
 	Warmup(context.Context) error
 	Ready() bool
-}, retryInterval time.Duration, log *slog.Logger) {
-	if retryInterval <= 0 {
-		retryInterval = warmupRetryInterval
-	}
+}, warmupTimeout, retryInterval time.Duration, log *slog.Logger) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -267,7 +272,10 @@ func runWarmupUntilReady(ctx context.Context, mgr interface {
 		if mgr.Ready() {
 			return
 		}
-		if err := mgr.Warmup(ctx); err == nil {
+		attemptCtx, cancel := context.WithTimeout(ctx, warmupTimeout)
+		err := mgr.Warmup(attemptCtx)
+		cancel()
+		if err == nil {
 			log.Info("startup warmup completed")
 			return
 		} else if ctx.Err() == nil {
@@ -309,11 +317,17 @@ func runValidateUpstream(ctx context.Context, cfgPath, upstreamID string) error 
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	runtimeCfg, err := cfg.BuildRuntime()
+	if err != nil {
+		return fmt.Errorf("build runtime config: %w", err)
+	}
 
 	var found *config.UpstreamConfig
+	var foundRuntime *config.UpstreamRuntimeConfig
 	for i := range cfg.Upstreams {
 		if cfg.Upstreams[i].ID == upstreamID {
 			found = &cfg.Upstreams[i]
+			foundRuntime = &runtimeCfg.Upstreams[i]
 			break
 		}
 	}
@@ -321,15 +335,30 @@ func runValidateUpstream(ctx context.Context, cfgPath, upstreamID string) error 
 		return fmt.Errorf("upstream %q not found in config", upstreamID)
 	}
 
-	mgr := upstream.NewManager(ctx, []upstream.Entry{
+	client, err := transport.NewMCPHTTPClient(found.ID, found.URL, found.Headers, transport.MCPHTTPClientConfig{
+		RequestTimeout:   foundRuntime.RequestTimeout,
+		MaxResponseBytes: foundRuntime.MaxResponseBytes,
+	})
+	if err != nil {
+		return fmt.Errorf("init upstream client: %w", err)
+	}
+	mgr, err := upstream.NewManager(ctx, []upstream.Entry{
 		{
 			ID:     found.ID,
 			Prefix: found.Prefix,
-			Client: transport.NewMCPHTTPClient(found.ID, found.URL, found.Headers),
+			Client: client,
 		},
+	}, upstream.ManagerConfig{
+		ToolsCacheTTL:  foundRuntime.ToolsCacheTTL,
+		RefreshTimeout: foundRuntime.RefreshTimeout,
 	})
+	if err != nil {
+		return fmt.Errorf("init upstream manager: %w", err)
+	}
 
-	if err := mgr.Warmup(ctx); err != nil {
+	warmupCtx, cancel := context.WithTimeout(ctx, runtimeCfg.Server.WarmupTimeout)
+	defer cancel()
+	if err := mgr.Warmup(warmupCtx); err != nil {
 		return fmt.Errorf("warmup failed: %w", err)
 	}
 	tools, err := mgr.ToolsList(ctx)

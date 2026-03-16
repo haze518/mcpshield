@@ -145,6 +145,15 @@ The demo stack runs with `auth.type: none`. See [API Key Auth](#api-key-auth) to
 
 server:
   listen: ":8080"
+  request_timeout: "60s"         # default: 60s; JSON-RPC request context deadline
+  read_timeout: "30s"            # default: 30s; inbound HTTP read timeout
+  write_timeout: "30s"           # default: 30s; outbound HTTP write timeout
+  idle_timeout: "120s"           # default: 120s; keep-alive timeout
+  max_request_bytes: 1048576     # default: 1 MiB; inbound request body limit
+  warmup_timeout: "30s"          # default: 30s; per startup warmup attempt
+  warmup_retry_interval: "5s"    # default: 5s; readiness retry cadence
+  session_ttl: "30m"             # default: 30m
+  session_max_entries: 10000     # default: 10000
 
 auth:
   type: none  # "none" | "api_key"
@@ -155,6 +164,10 @@ upstreams:
   - id: github
     prefix: github
     url: https://api.github.com/mcp   # ${GITHUB_MCP_URL} works too
+    request_timeout: "30s"            # default: 30s; per upstream HTTP request
+    max_response_bytes: 4194304       # default: 4 MiB; upstream response cap
+    tools_cache_ttl: "10s"            # default: 10s; merged tool cache freshness
+    refresh_timeout: "30s"            # default: 30s; background tool refresh budget
     headers:
       Authorization: "Bearer ${GITHUB_TOKEN}"
 
@@ -185,6 +198,12 @@ audit:
   integrity:
     hash_chain: true
 ```
+
+Defaults are applied in `pkg/config` when a field is omitted. Explicit duration and byte-limit overrides must be greater than zero.
+
+`/readyz` reports `200` only after the initial warmup has completed successfully at least once. Startup warmup retries in the background using `server.warmup_timeout` and `server.warmup_retry_interval`; the process does not fail fast by default.
+
+`tools_cache_ttl` and `refresh_timeout` are configured per upstream in YAML, but MCPShield maintains one merged discovery cache. When upstreams specify different values, the effective shared manager value is the smallest configured one.
 
 ### Environment variable interpolation
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -20,13 +21,9 @@ import (
 )
 
 const (
-	requestTimeout  = 60 * time.Second
 	protocolVersion = "2024-11-05"
 	gatewayName     = "mcpshield"
 	gatewayVersion  = "0.1.0"
-	defaultMaxBody  = 1 << 20 // 1 MiB
-	defaultSessionTTL      = 30 * time.Minute
-	defaultSessionMaxEntries = 10_000
 )
 
 type contextKey string
@@ -39,6 +36,7 @@ type Gateway struct {
 	upstream        upstream.Manager
 	audit           audit.Logger
 	metrics         *observability.Registry
+	requestTimeout  time.Duration
 	maxRequestBytes int64
 	sessionMu       sync.RWMutex
 	sessionClients  map[string]sessionBinding
@@ -52,18 +50,52 @@ type sessionBinding struct {
 	expiresAt time.Time
 }
 
-func New(a auth.Authenticator, p policy.Engine, u upstream.Manager, al audit.Logger) *Gateway {
-	return &Gateway{
-		auth:            a,
-		policy:          p,
-		upstream:        u,
-		audit:           al,
-		maxRequestBytes: defaultMaxBody,
-		sessionClients:  make(map[string]sessionBinding),
-		sessionTTL:      defaultSessionTTL,
-		sessionMaxEntries: defaultSessionMaxEntries,
-		timeNow:         time.Now,
+type Config struct {
+	RequestTimeout    time.Duration
+	MaxRequestBytes   int64
+	SessionTTL        time.Duration
+	SessionMaxEntries int
+	TimeNow           func() time.Time
+}
+
+// New expects normalized runtime config; invalid zero/negative values are
+// rejected.
+func New(a auth.Authenticator, p policy.Engine, u upstream.Manager, al audit.Logger, cfg Config) (*Gateway, error) {
+	if err := validateConfig(cfg); err != nil {
+		return nil, err
 	}
+	now := cfg.TimeNow
+	if now == nil {
+		now = time.Now
+	}
+	return &Gateway{
+		auth:              a,
+		policy:            p,
+		upstream:          u,
+		audit:             al,
+		requestTimeout:    cfg.RequestTimeout,
+		maxRequestBytes:   cfg.MaxRequestBytes,
+		sessionClients:    make(map[string]sessionBinding),
+		sessionTTL:        cfg.SessionTTL,
+		sessionMaxEntries: cfg.SessionMaxEntries,
+		timeNow:           now,
+	}, nil
+}
+
+func validateConfig(cfg Config) error {
+	if cfg.RequestTimeout <= 0 {
+		return fmt.Errorf("gateway request timeout must be > 0")
+	}
+	if cfg.MaxRequestBytes <= 0 {
+		return fmt.Errorf("gateway max request bytes must be > 0")
+	}
+	if cfg.SessionTTL <= 0 {
+		return fmt.Errorf("gateway session TTL must be > 0")
+	}
+	if cfg.SessionMaxEntries <= 0 {
+		return fmt.Errorf("gateway session max entries must be > 0")
+	}
+	return nil
 }
 
 // SetMetrics wires an optional Prometheus metrics registry into the gateway.
@@ -76,14 +108,16 @@ func (g *Gateway) SetMetrics(r *observability.Registry) {
 	}
 }
 
-// SetMaxRequestBytes overrides the default 1 MiB inbound body limit.
+// SetMaxRequestBytes overrides the inbound body limit after construction.
+// Prefer passing normalized Config to New in production wiring.
 func (g *Gateway) SetMaxRequestBytes(n int64) {
 	if n > 0 {
 		g.maxRequestBytes = n
 	}
 }
 
-// SetSessionConfig overrides the default in-memory session TTL and cap.
+// SetSessionConfig overrides the in-memory session TTL and cap after
+// construction. Prefer passing normalized Config to New in production wiring.
 func (g *Gateway) SetSessionConfig(ttl time.Duration, maxEntries int) {
 	if ttl > 0 {
 		g.sessionTTL = ttl
@@ -93,7 +127,8 @@ func (g *Gateway) SetSessionConfig(ttl time.Duration, maxEntries int) {
 	}
 }
 
-// SetTimeNow overrides the clock used by session lifecycle logic.
+// SetTimeNow overrides the clock used by session lifecycle logic. Primarily
+// useful in tests.
 func (g *Gateway) SetTimeNow(now func() time.Time) {
 	if now != nil {
 		g.timeNow = now
@@ -140,7 +175,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), g.requestTimeout)
 	defer cancel()
 
 	// Enforce body size limit.

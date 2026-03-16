@@ -164,7 +164,7 @@ func TestRunWarmupUntilReadyRetriesUntilSuccess(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runWarmupUntilReady(ctx, mgr, 10*time.Millisecond, nilLogger())
+		runWarmupUntilReady(ctx, mgr, 50*time.Millisecond, 10*time.Millisecond, nilLogger())
 		close(done)
 	}()
 
@@ -186,7 +186,7 @@ func TestRunWarmupUntilReadyStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		runWarmupUntilReady(ctx, mgr, 10*time.Millisecond, nilLogger())
+		runWarmupUntilReady(ctx, mgr, 50*time.Millisecond, 10*time.Millisecond, nilLogger())
 		close(done)
 	}()
 

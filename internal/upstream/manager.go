@@ -111,8 +111,6 @@ func (m *stubManager) ToolsCall(_ context.Context, req *mcp.ToolsCallRequest) (*
 
 // ---- real ---------------------------------------------------------------
 
-const defaultCacheTTL = 10 * time.Second
-
 type toolRoute struct {
 	upstreamID   string
 	client       Client
@@ -129,6 +127,7 @@ type realManager struct {
 	ctx      context.Context // server lifecycle context
 	entries  []Entry
 	cacheTTL time.Duration
+	refreshTimeout time.Duration
 
 	mu sync.Mutex
 	// cached is the single source of truth for readiness: if a usable cache is
@@ -140,14 +139,35 @@ type realManager struct {
 	metrics ManagerMetrics // optional; nil = no Prometheus counters
 }
 
+type ManagerConfig struct {
+	ToolsCacheTTL  time.Duration
+	RefreshTimeout time.Duration
+}
+
 // NewManager creates a real upstream manager. ctx is the server lifecycle
 // context: background refresh goroutines are cancelled when ctx is done.
-func NewManager(ctx context.Context, entries []Entry) *realManager {
-	return &realManager{
-		ctx:      ctx,
-		entries:  entries,
-		cacheTTL: defaultCacheTTL,
+// Config must already be normalized; invalid zero/negative values are
+// rejected.
+func NewManager(ctx context.Context, entries []Entry, cfg ManagerConfig) (*realManager, error) {
+	if err := validateManagerConfig(cfg); err != nil {
+		return nil, err
 	}
+	return &realManager{
+		ctx:            ctx,
+		entries:        entries,
+		cacheTTL:       cfg.ToolsCacheTTL,
+		refreshTimeout: cfg.RefreshTimeout,
+	}, nil
+}
+
+func validateManagerConfig(cfg ManagerConfig) error {
+	if cfg.ToolsCacheTTL <= 0 {
+		return fmt.Errorf("upstream manager tools cache TTL must be > 0")
+	}
+	if cfg.RefreshTimeout <= 0 {
+		return fmt.Errorf("upstream manager refresh timeout must be > 0")
+	}
+	return nil
 }
 
 // SetMetrics wires Prometheus counters for cache refresh failures.
@@ -264,7 +284,7 @@ func (m *realManager) getCache(ctx context.Context) (*toolsCache, error) {
 		if m.bgRefresh.CompareAndSwap(false, true) {
 			go func() {
 				defer m.bgRefresh.Store(false)
-				ctx2, cancel := context.WithTimeout(m.ctx, 30*time.Second)
+				ctx2, cancel := context.WithTimeout(m.ctx, m.refreshTimeout)
 				defer cancel()
 				if _, err := m.doRefresh(ctx2); err != nil && m.ctx.Err() == nil {
 					slog.Default().Warn("upstream cache refresh failed",

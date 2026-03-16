@@ -7,9 +7,26 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/haze518/mcpshield/internal/transport"
 )
+
+func defaultClientConfig() transport.MCPHTTPClientConfig {
+	return transport.MCPHTTPClientConfig{
+		RequestTimeout:   30 * time.Second,
+		MaxResponseBytes: 4 << 20,
+	}
+}
+
+func mustClient(t *testing.T, url string, cfg transport.MCPHTTPClientConfig) *transport.MCPHTTPClient {
+	t.Helper()
+	client, err := transport.NewMCPHTTPClient("test", url, nil, cfg)
+	if err != nil {
+		t.Fatalf("NewMCPHTTPClient: %v", err)
+	}
+	return client
+}
 
 // decodeRPCID extracts the JSON-RPC id from an incoming request body.
 func decodeRPCID(r *http.Request) json.RawMessage {
@@ -30,7 +47,7 @@ func TestNon2xxResponseReturnsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := transport.NewMCPHTTPClient("test", srv.URL, nil)
+	client := mustClient(t, srv.URL, defaultClientConfig())
 	_, err := client.ToolsList(context.Background())
 	if err == nil {
 		t.Fatal("expected error for non-2xx response, got nil")
@@ -47,7 +64,7 @@ func TestNon2xxIncrementsProtocolErrorMetric(t *testing.T) {
 	defer srv.Close()
 
 	rec := &metricsRecorder{}
-	client := transport.NewMCPHTTPClient("test", srv.URL, nil)
+	client := mustClient(t, srv.URL, defaultClientConfig())
 	client.SetMetrics(rec)
 
 	_, err := client.ToolsList(context.Background())
@@ -75,7 +92,7 @@ func TestWrongJSONRPCVersionReturnsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := transport.NewMCPHTTPClient("test", srv.URL, nil)
+	client := mustClient(t, srv.URL, defaultClientConfig())
 	_, err := client.ToolsList(context.Background())
 	if err == nil {
 		t.Fatal("expected error for wrong jsonrpc version, got nil")
@@ -96,7 +113,7 @@ func TestIDMismatchReturnsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := transport.NewMCPHTTPClient("test", srv.URL, nil)
+	client := mustClient(t, srv.URL, defaultClientConfig())
 	_, err := client.ToolsList(context.Background())
 	if err == nil {
 		t.Fatal("expected error for ID mismatch, got nil")
@@ -118,7 +135,7 @@ func TestMissingResultAndErrorReturnsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := transport.NewMCPHTTPClient("test", srv.URL, nil)
+	client := mustClient(t, srv.URL, defaultClientConfig())
 	_, err := client.ToolsList(context.Background())
 	if err == nil {
 		t.Fatal("expected error for response with neither result nor error, got nil")
@@ -152,7 +169,7 @@ func TestResponseTooLargeReturnsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := transport.NewMCPHTTPClient("test", srv.URL, nil)
+	client := mustClient(t, srv.URL, defaultClientConfig())
 	_, err := client.ToolsList(context.Background())
 	if err == nil {
 		t.Fatal("expected error for oversized response, got nil")
@@ -181,7 +198,7 @@ func TestResponseTooLargeIncrementsMetric(t *testing.T) {
 	defer srv.Close()
 
 	rec := &metricsRecorder{}
-	client := transport.NewMCPHTTPClient("test", srv.URL, nil)
+	client := mustClient(t, srv.URL, defaultClientConfig())
 	client.SetMetrics(rec)
 
 	_, err := client.ToolsList(context.Background())
@@ -190,6 +207,69 @@ func TestResponseTooLargeIncrementsMetric(t *testing.T) {
 	}
 	if rec.responseTooLarge != 1 {
 		t.Errorf("expected 1 response-too-large metric, got %d", rec.responseTooLarge)
+	}
+}
+
+func TestConfiguredMaxResponseBytesIsApplied(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := decodeRPCID(r)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"jsonrpc":"2.0","id":`))
+		w.Write(id)
+		w.Write([]byte(`,"result":{"tools":[{"name":"` + strings.Repeat("x", 256) + `","description":""}]}}`))
+	}))
+	defer srv.Close()
+
+	client, err := transport.NewMCPHTTPClient("test", srv.URL, nil, transport.MCPHTTPClientConfig{
+		RequestTimeout:   30 * time.Second,
+		MaxResponseBytes: 128,
+	})
+	if err != nil {
+		t.Fatalf("NewMCPHTTPClient: %v", err)
+	}
+	_, err = client.ToolsList(context.Background())
+	if err == nil {
+		t.Fatal("expected configured response size limit to be enforced")
+	}
+	if !strings.Contains(err.Error(), "exceeded") {
+		t.Fatalf("expected size limit error, got %v", err)
+	}
+}
+
+func TestConfiguredRequestTimeoutIsApplied(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		id := decodeRPCID(r)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      id,
+			"result":  map[string]any{"tools": []any{}},
+		})
+	}))
+	defer srv.Close()
+
+	client, err := transport.NewMCPHTTPClient("test", srv.URL, nil, transport.MCPHTTPClientConfig{
+		RequestTimeout:   20 * time.Millisecond,
+		MaxResponseBytes: 4 << 20,
+	})
+	if err != nil {
+		t.Fatalf("NewMCPHTTPClient: %v", err)
+	}
+	start := time.Now()
+	_, err = client.ToolsList(context.Background())
+	if err == nil {
+		t.Fatal("expected configured request timeout to abort the request")
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("request timeout not applied promptly, elapsed=%v", elapsed)
+	}
+}
+
+func TestNewMCPHTTPClientRejectsInvalidConfig(t *testing.T) {
+	_, err := transport.NewMCPHTTPClient("test", "http://example.com", nil, transport.MCPHTTPClientConfig{})
+	if err == nil {
+		t.Fatal("expected invalid MCP client config to be rejected")
 	}
 }
 

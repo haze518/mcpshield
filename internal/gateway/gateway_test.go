@@ -78,6 +78,19 @@ func (m *notReadyManager) ToolsCall(context.Context, *mcp.ToolsCallRequest) (*up
 	return nil, upstream.ErrNotReady
 }
 
+type slowManager struct{}
+
+func (m *slowManager) Warmup(context.Context) error { return nil }
+func (m *slowManager) Ready() bool                  { return true }
+func (m *slowManager) ToolsList(ctx context.Context) ([]mcp.Tool, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (m *slowManager) ToolsCall(ctx context.Context, _ *mcp.ToolsCallRequest) (*upstream.CallResult, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
 func (l *testAuditLogger) Log(_ context.Context, event *audit.Event) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -116,28 +129,43 @@ type httpResult struct {
 	rawBody string
 }
 
+func defaultGatewayConfig() gateway.Config {
+	return gateway.Config{
+		RequestTimeout:    60 * time.Second,
+		MaxRequestBytes:   1 << 20,
+		SessionTTL:        30 * time.Minute,
+		SessionMaxEntries: 10_000,
+	}
+}
+
+func mustGateway(t *testing.T, a auth.Authenticator, eng policy.Engine, up upstream.Manager, al audit.Logger, cfg gateway.Config) *gateway.Gateway {
+	t.Helper()
+	gw, err := gateway.New(a, eng, up, al, cfg)
+	if err != nil {
+		t.Fatalf("gateway.New: %v", err)
+	}
+	return gw
+}
+
 func newTestServer(al audit.Logger, eng policy.Engine) *httptest.Server {
 	return newTestServerWithUpstream(al, eng, upstream.NewStubManager())
 }
 
 func newTestServerWithUpstream(al audit.Logger, eng policy.Engine, up upstream.Manager) *httptest.Server {
-	gw := gateway.New(
-		auth.NewAllowAll(),
-		eng,
-		up,
-		al,
-	)
+	gw, err := gateway.New(auth.NewAllowAll(), eng, up, al, defaultGatewayConfig())
+	if err != nil {
+		panic(err)
+	}
 	return httptest.NewServer(gw)
 }
 
 func newTestServerWithMaxBytes(al audit.Logger, eng policy.Engine, maxBytes int64) *httptest.Server {
-	gw := gateway.New(
-		auth.NewAllowAll(),
-		eng,
-		upstream.NewStubManager(),
-		al,
-	)
-	gw.SetMaxRequestBytes(maxBytes)
+	cfg := defaultGatewayConfig()
+	cfg.MaxRequestBytes = maxBytes
+	gw, err := gateway.New(auth.NewAllowAll(), eng, upstream.NewStubManager(), al, cfg)
+	if err != nil {
+		panic(err)
+	}
 	return httptest.NewServer(gw)
 }
 
@@ -418,7 +446,7 @@ func TestReadyzReturns200AfterWarmup(t *testing.T) {
 
 func TestMetricsStillWorksIndependentlyOfReadyz(t *testing.T) {
 	up := &readyManager{}
-	gw := gateway.New(auth.NewAllowAll(), policy.NewDenyAllEngine(), up, &testAuditLogger{})
+	gw := mustGateway(t, auth.NewAllowAll(), policy.NewDenyAllEngine(), up, &testAuditLogger{}, defaultGatewayConfig())
 	gw.SetMetrics(observability.NewRegistry(false))
 	srv := httptest.NewServer(gw)
 	defer srv.Close()
@@ -486,14 +514,43 @@ func TestToolsCallReturns503WhenUpstreamNotReady(t *testing.T) {
 	}
 }
 
+func TestConfiguredRequestTimeoutCancelsSlowRequest(t *testing.T) {
+	cfg := defaultGatewayConfig()
+	cfg.RequestTimeout = 20 * time.Millisecond
+	gw := mustGateway(t, auth.NewAllowAll(), allowAllStubToolsEngine(t), &slowManager{}, &testAuditLogger{}, cfg)
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	sessionID := bootstrapSession(t, srv.URL)
+	start := time.Now()
+	res := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":8,"method":"tools/list"}`, map[string]string{mcp.SessionHeader: sessionID})
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("request timeout was not applied promptly, elapsed=%v", elapsed)
+	}
+	if res.status != http.StatusInternalServerError {
+		t.Fatalf("status: want 500, got %d", res.status)
+	}
+	if res.rpc.Error == nil || res.rpc.Error.Message != "upstream error" {
+		t.Fatalf("expected upstream error after request timeout, got %+v", res.rpc.Error)
+	}
+}
+
+func TestGatewayNewRejectsInvalidConfig(t *testing.T) {
+	_, err := gateway.New(auth.NewAllowAll(), policy.NewDenyAllEngine(), upstream.NewStubManager(), &testAuditLogger{}, gateway.Config{})
+	if err == nil {
+		t.Fatal("expected invalid gateway config to be rejected")
+	}
+}
+
 func TestAuthFailureReturns401(t *testing.T) {
-	gw := gateway.New(
+	gw := mustGateway(t,
 		auth.NewAPIKeyAuthenticator(map[string]string{
 			auth.NewKeyHash("secret-token"): "dev-team",
 		}),
 		policy.NewDenyAllEngine(),
 		upstream.NewStubManager(),
 		&testAuditLogger{},
+		defaultGatewayConfig(),
 	)
 	srv := httptest.NewServer(gw)
 	defer srv.Close()
@@ -670,11 +727,12 @@ func TestInitializeIgnoresClientProvidedSessionID(t *testing.T) {
 }
 
 func TestInitializeAuditFailureDoesNotPublishSession(t *testing.T) {
-	gw := gateway.New(
+	gw := mustGateway(t,
 		auth.NewAllowAll(),
 		allowAllStubToolsEngine(t),
 		upstream.NewStubManager(),
 		failingAuditLogger{},
+		defaultGatewayConfig(),
 	)
 	srv := httptest.NewServer(gw)
 	defer srv.Close()
@@ -736,7 +794,7 @@ func TestToolsListRejectsMissingSessionAndAudits(t *testing.T) {
 }
 
 func TestSessionCannotBeReusedByDifferentClient(t *testing.T) {
-	gw := gateway.New(
+	gw := mustGateway(t,
 		auth.NewAPIKeyAuthenticator(map[string]string{
 			auth.NewKeyHash("token-a"): "client-a",
 			auth.NewKeyHash("token-b"): "client-b",
@@ -744,6 +802,7 @@ func TestSessionCannotBeReusedByDifferentClient(t *testing.T) {
 		allowAllStubToolsEngine(t),
 		upstream.NewStubManager(),
 		&testAuditLogger{},
+		defaultGatewayConfig(),
 	)
 	srv := httptest.NewServer(gw)
 	defer srv.Close()
@@ -827,7 +886,7 @@ func TestInitializedNotificationWithInvalidSessionReturnsNon2xxAndAudits(t *test
 
 func TestInitializedNotificationAuditFailureReturnsNon2xxNoBody(t *testing.T) {
 	al := &failAfterNAuditLogger{failAt: 2}
-	gw := gateway.New(auth.NewAllowAll(), allowAllStubToolsEngine(t), upstream.NewStubManager(), al)
+	gw := mustGateway(t, auth.NewAllowAll(), allowAllStubToolsEngine(t), upstream.NewStubManager(), al, defaultGatewayConfig())
 	srv := httptest.NewServer(gw)
 	defer srv.Close()
 
@@ -845,7 +904,7 @@ func TestInitializedNotificationAuditFailureReturnsNon2xxNoBody(t *testing.T) {
 
 func TestSessionExpiresWithoutUse(t *testing.T) {
 	al := &testAuditLogger{}
-	gw := gateway.New(auth.NewAllowAll(), allowAllStubToolsEngine(t), upstream.NewStubManager(), al)
+	gw := mustGateway(t, auth.NewAllowAll(), allowAllStubToolsEngine(t), upstream.NewStubManager(), al, defaultGatewayConfig())
 	now := time.Now()
 	gw.SetTimeNow(func() time.Time { return now })
 	gw.SetSessionConfig(time.Minute, 4)
@@ -862,7 +921,7 @@ func TestSessionExpiresWithoutUse(t *testing.T) {
 }
 
 func TestSessionUseRenewsTTL(t *testing.T) {
-	gw := gateway.New(auth.NewAllowAll(), allowAllStubToolsEngine(t), upstream.NewStubManager(), &testAuditLogger{})
+	gw := mustGateway(t, auth.NewAllowAll(), allowAllStubToolsEngine(t), upstream.NewStubManager(), &testAuditLogger{}, defaultGatewayConfig())
 	now := time.Now()
 	gw.SetTimeNow(func() time.Time { return now })
 	gw.SetSessionConfig(time.Minute, 4)
@@ -883,7 +942,7 @@ func TestSessionUseRenewsTTL(t *testing.T) {
 }
 
 func TestSessionCapacityEvictsOldest(t *testing.T) {
-	gw := gateway.New(auth.NewAllowAll(), allowAllStubToolsEngine(t), upstream.NewStubManager(), &testAuditLogger{})
+	gw := mustGateway(t, auth.NewAllowAll(), allowAllStubToolsEngine(t), upstream.NewStubManager(), &testAuditLogger{}, defaultGatewayConfig())
 	now := time.Now()
 	gw.SetTimeNow(func() time.Time { return now })
 	gw.SetSessionConfig(time.Hour, 2)
@@ -929,13 +988,14 @@ func TestNotificationReturns204(t *testing.T) {
 // notification (no id field) fails auth, the gateway returns 401 with an
 // empty body — never a JSON-RPC error object.
 func TestNotificationAuthFailureReturns401WithNoBody(t *testing.T) {
-	gw := gateway.New(
+	gw := mustGateway(t,
 		auth.NewAPIKeyAuthenticator(map[string]string{
 			auth.NewKeyHash("secret-token"): "dev-team",
 		}),
 		policy.NewDenyAllEngine(),
 		upstream.NewStubManager(),
 		&testAuditLogger{},
+		defaultGatewayConfig(),
 	)
 	srv := httptest.NewServer(gw)
 	defer srv.Close()
@@ -1234,13 +1294,14 @@ rules:
 // ---------------------------------------------------------------------------
 
 func TestAPIKeyAuthRejectsUnauthorized(t *testing.T) {
-	gw := gateway.New(
+	gw := mustGateway(t,
 		auth.NewAPIKeyAuthenticator(map[string]string{
 			auth.NewKeyHash("secret-token"): "dev-team",
 		}),
 		policy.NewDenyAllEngine(),
 		upstream.NewStubManager(),
 		&testAuditLogger{},
+		defaultGatewayConfig(),
 	)
 	srv := httptest.NewServer(gw)
 	defer srv.Close()
@@ -1256,13 +1317,14 @@ func TestAPIKeyAuthRejectsUnauthorized(t *testing.T) {
 
 func TestAPIKeyAuthAcceptsValidToken(t *testing.T) {
 	const rawToken = "secret-token"
-	gw := gateway.New(
+	gw := mustGateway(t,
 		auth.NewAPIKeyAuthenticator(map[string]string{
 			auth.NewKeyHash(rawToken): "dev-team",
 		}),
 		allowAllStubToolsEngine(t),
 		upstream.NewStubManager(),
 		&testAuditLogger{},
+		defaultGatewayConfig(),
 	)
 	srv := httptest.NewServer(gw)
 	defer srv.Close()

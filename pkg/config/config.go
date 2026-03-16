@@ -24,6 +24,7 @@ type ServerConfig struct {
 	InsecureAllowAnonymous bool   `yaml:"insecure_allow_anonymous,omitempty"`
 	SessionTTL             string `yaml:"session_ttl,omitempty"`         // e.g. "30m"
 	SessionMaxEntries      *int   `yaml:"session_max_entries,omitempty"` // e.g. 10000
+	WarmupRetryInterval    string `yaml:"warmup_retry_interval,omitempty"` // e.g. "5s"
 }
 
 // ---- auth config --------------------------------------------------------
@@ -139,6 +140,15 @@ func validateServer(server ServerConfig) error {
 		}
 		if ttl <= 0 {
 			return fmt.Errorf("server.session_ttl must be > 0")
+		}
+	}
+	if server.WarmupRetryInterval != "" {
+		d, err := time.ParseDuration(server.WarmupRetryInterval)
+		if err != nil {
+			return fmt.Errorf("server.warmup_retry_interval: %w", err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("server.warmup_retry_interval must be > 0")
 		}
 	}
 	if server.SessionMaxEntries != nil && *server.SessionMaxEntries <= 0 {

@@ -3,6 +3,7 @@ package upstream_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -72,6 +73,9 @@ func TestToolsListReturnsPrefixedNames(t *testing.T) {
 		{ID: "fs", Prefix: "fs", Client: client},
 	})
 
+	if err := mgr.Warmup(context.Background()); err != nil {
+		t.Fatalf("Warmup: %v", err)
+	}
 	tools, err := mgr.ToolsList(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -103,6 +107,9 @@ func TestToolsCallRoutesAndStripsPrefix(t *testing.T) {
 		{ID: "fs", Prefix: "fs", Client: client},
 	})
 
+	if err := mgr.Warmup(context.Background()); err != nil {
+		t.Fatalf("Warmup: %v", err)
+	}
 	result, err := mgr.ToolsCall(context.Background(), &mcp.ToolsCallRequest{
 		Name:      "fs.read_file",
 		Arguments: map[string]any{"path": "/tmp/test"},
@@ -133,6 +140,9 @@ func TestToolsCallUnknownToolReturnsError(t *testing.T) {
 		{ID: "fs", Prefix: "fs", Client: client},
 	})
 
+	if err := mgr.Warmup(context.Background()); err != nil {
+		t.Fatalf("Warmup: %v", err)
+	}
 	_, err := mgr.ToolsCall(context.Background(), &mcp.ToolsCallRequest{
 		Name: "fs.nonexistent",
 	})
@@ -160,6 +170,9 @@ func TestToolsListMultipleUpstreams(t *testing.T) {
 		{ID: "gh", Prefix: "gh", Client: transport.NewMCPHTTPClient("gh", srv2.URL, nil)},
 	})
 
+	if err := mgr.Warmup(context.Background()); err != nil {
+		t.Fatalf("Warmup: %v", err)
+	}
 	tools, err := mgr.ToolsList(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -211,13 +224,251 @@ func (c *blockingClient) ToolsList(ctx context.Context) ([]mcp.Tool, error) {
 }
 
 func (c *blockingClient) ToolsCall(_ context.Context, _ *mcp.ToolsCallRequest) (*mcp.ToolsCallResult, error) {
-	return nil, fmt.Errorf("not implemented")
+	return &mcp.ToolsCallResult{
+		Content: []mcp.Content{{Type: "text", Text: "ok"}},
+	}, nil
 }
 
 func (c *blockingClient) Calls() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.n
+}
+
+func TestWarmupTransitionsManagerToReady(t *testing.T) {
+	client := &blockingClient{
+		tools:    []mcp.Tool{{Name: "tool1", Description: "desc"}},
+		blockAt:  100,
+		releaseC: make(chan struct{}),
+	}
+	close(client.releaseC)
+
+	mgr := upstream.NewManager(context.Background(), []upstream.Entry{
+		{ID: "test", Prefix: "p", Client: client},
+	})
+	if mgr.Ready() {
+		t.Fatal("manager must start unready")
+	}
+	if err := mgr.Warmup(context.Background()); err != nil {
+		t.Fatalf("Warmup: %v", err)
+	}
+	if !mgr.Ready() {
+		t.Fatal("manager must be ready after successful warmup")
+	}
+}
+
+func TestWarmupFailureLeavesManagerUnready(t *testing.T) {
+	client := &fakeCountClient{tools: []mcp.Tool{{Name: "tool1"}}, failAfter: 0}
+	mgr := upstream.NewManager(context.Background(), []upstream.Entry{
+		{ID: "test", Prefix: "p", Client: client},
+	})
+	if err := mgr.Warmup(context.Background()); err == nil {
+		t.Fatal("expected Warmup to fail")
+	}
+	if mgr.Ready() {
+		t.Fatal("manager must remain unready after failed warmup")
+	}
+}
+
+func TestErrNotReadyReturnedBeforeSuccessfulWarmup(t *testing.T) {
+	client := &fakeCountClient{tools: []mcp.Tool{{Name: "tool1"}}, failAfter: 1}
+	mgr := upstream.NewManager(context.Background(), []upstream.Entry{
+		{ID: "test", Prefix: "p", Client: client},
+	})
+	_, err := mgr.ToolsList(context.Background())
+	if !errors.Is(err, upstream.ErrNotReady) {
+		t.Fatalf("expected ErrNotReady, got %v", err)
+	}
+}
+
+type flakyWarmupClient struct {
+	mu       sync.Mutex
+	calls    int
+	failures int
+	tools    []mcp.Tool
+}
+
+func (c *flakyWarmupClient) ToolsList(_ context.Context) ([]mcp.Tool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	if c.failures > 0 {
+		c.failures--
+		return nil, fmt.Errorf("temporary failure")
+	}
+	return c.tools, nil
+}
+
+func (c *flakyWarmupClient) ToolsCall(_ context.Context, _ *mcp.ToolsCallRequest) (*mcp.ToolsCallResult, error) {
+	return &mcp.ToolsCallResult{Content: []mcp.Content{{Type: "text", Text: "ok"}}}, nil
+}
+
+func TestWarmupRetryAfterFailureEventuallyReady(t *testing.T) {
+	client := &flakyWarmupClient{
+		failures: 1,
+		tools:    []mcp.Tool{{Name: "tool1", Description: "desc"}},
+	}
+	mgr := upstream.NewManager(context.Background(), []upstream.Entry{
+		{ID: "test", Prefix: "p", Client: client},
+	})
+	if err := mgr.Warmup(context.Background()); err == nil {
+		t.Fatal("first Warmup should fail")
+	}
+	if mgr.Ready() {
+		t.Fatal("manager must remain unready after failed warmup")
+	}
+	if err := mgr.Warmup(context.Background()); err != nil {
+		t.Fatalf("second Warmup: %v", err)
+	}
+	if !mgr.Ready() {
+		t.Fatal("manager must become ready after successful retry")
+	}
+}
+
+func TestConcurrentWarmupDoesNotDuplicateInitialLoad(t *testing.T) {
+	releaseC := make(chan struct{})
+	client := &blockingClient{
+		tools:    []mcp.Tool{{Name: "tool1", Description: "desc"}},
+		blockAt:  1,
+		releaseC: releaseC,
+	}
+	mgr := upstream.NewManagerWithTTL(context.Background(), []upstream.Entry{
+		{ID: "test", Prefix: "p", Client: client},
+	}, time.Minute)
+
+	errCh := make(chan error, 3)
+	for range 3 {
+		go func() {
+			errCh <- mgr.Warmup(context.Background())
+		}()
+	}
+
+	for i := 0; i < 50; i++ {
+		if mgr.LoadingInProgress() {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(releaseC)
+
+	for range 3 {
+		if err := <-errCh; err != nil {
+			t.Fatalf("Warmup returned error: %v", err)
+		}
+	}
+	if calls := client.Calls(); calls != 1 {
+		t.Fatalf("expected exactly 1 initial ToolsList call, got %d", calls)
+	}
+}
+
+func TestInvalidateCacheResetsReadiness(t *testing.T) {
+	client := &blockingClient{
+		tools:    []mcp.Tool{{Name: "tool1", Description: "desc"}},
+		blockAt:  100,
+		releaseC: make(chan struct{}),
+	}
+	close(client.releaseC)
+	mgr := upstream.NewManager(context.Background(), []upstream.Entry{
+		{ID: "test", Prefix: "p", Client: client},
+	})
+	if err := mgr.Warmup(context.Background()); err != nil {
+		t.Fatalf("Warmup: %v", err)
+	}
+	if !mgr.Ready() {
+		t.Fatal("manager must be ready after warmup")
+	}
+	mgr.InvalidateCache()
+	if mgr.Ready() {
+		t.Fatal("manager must become unready after cache invalidation")
+	}
+	_, err := mgr.ToolsList(context.Background())
+	if !errors.Is(err, upstream.ErrNotReady) {
+		t.Fatalf("expected ErrNotReady after invalidation, got %v", err)
+	}
+}
+
+func TestWarmupAfterInvalidateRestoresReadiness(t *testing.T) {
+	client := &blockingClient{
+		tools:    []mcp.Tool{{Name: "tool1", Description: "desc"}},
+		blockAt:  100,
+		releaseC: make(chan struct{}),
+	}
+	close(client.releaseC)
+	mgr := upstream.NewManager(context.Background(), []upstream.Entry{
+		{ID: "test", Prefix: "p", Client: client},
+	})
+	if err := mgr.Warmup(context.Background()); err != nil {
+		t.Fatalf("Warmup: %v", err)
+	}
+	mgr.InvalidateCache()
+	if mgr.Ready() {
+		t.Fatal("manager must be unready immediately after invalidation")
+	}
+	if err := mgr.Warmup(context.Background()); err != nil {
+		t.Fatalf("Warmup after invalidation: %v", err)
+	}
+	if !mgr.Ready() {
+		t.Fatal("manager must be ready again after successful warmup")
+	}
+}
+
+func TestInvalidateCacheDuringInFlightRefreshRestoresReadinessOnRefreshSuccess(t *testing.T) {
+	releaseC := make(chan struct{})
+	client := &blockingClient{
+		tools:    []mcp.Tool{{Name: "tool1", Description: "desc"}},
+		blockAt:  2,
+		releaseC: releaseC,
+	}
+	mgr := upstream.NewManagerWithTTL(context.Background(), []upstream.Entry{
+		{ID: "test", Prefix: "p", Client: client},
+	}, 5*time.Millisecond)
+
+	if err := mgr.Warmup(context.Background()); err != nil {
+		t.Fatalf("Warmup: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	got, err := mgr.ToolsList(context.Background())
+	if err != nil {
+		t.Fatalf("ToolsList: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected stale cache before refresh completion, got %v", got)
+	}
+
+	for i := 0; i < 100; i++ {
+		if mgr.BgRefreshInProgress() {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !mgr.BgRefreshInProgress() {
+		t.Fatal("expected background refresh to be in progress")
+	}
+
+	mgr.InvalidateCache()
+	if mgr.Ready() {
+		t.Fatal("manager must become unready after invalidation while refresh is still in flight")
+	}
+
+	close(releaseC)
+	for i := 0; i < 100; i++ {
+		if !mgr.BgRefreshInProgress() {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !mgr.Ready() {
+		t.Fatal("successful in-flight refresh must restore readiness after invalidation")
+	}
+
+	got, err = mgr.ToolsList(context.Background())
+	if err != nil {
+		t.Fatalf("ToolsList after refresh completion: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "p.tool1" {
+		t.Fatalf("unexpected tools after refresh completion: %v", got)
+	}
 }
 
 func TestStaleCacheReturnedImmediatelyWhileRefreshing(t *testing.T) {
@@ -230,11 +481,11 @@ func TestStaleCacheReturnedImmediatelyWhileRefreshing(t *testing.T) {
 		{ID: "test", Prefix: "p", Client: client},
 	}, 5*time.Millisecond)
 
-	// First call: populates cache (call #1, not blocked).
-	got, err := mgr.ToolsList(context.Background())
-	if err != nil {
-		t.Fatalf("first ToolsList: %v", err)
+	// Warmup: populates cache (call #1, not blocked).
+	if err := mgr.Warmup(context.Background()); err != nil {
+		t.Fatalf("Warmup: %v", err)
 	}
+	got, err := mgr.ToolsList(context.Background())
 	if len(got) != 1 || got[0].Name != "p.tool1" {
 		t.Fatalf("unexpected tools: %v", got)
 	}
@@ -293,8 +544,42 @@ func TestStaleCacheReturnedImmediatelyWhileRefreshing(t *testing.T) {
 	}
 }
 
+func TestToolsCallDoesNotBlockOnRefreshWhenStaleCacheExists(t *testing.T) {
+	releaseC := make(chan struct{})
+	client := &blockingClient{
+		tools:    []mcp.Tool{{Name: "tool1", Description: "desc"}},
+		blockAt:  2,
+		releaseC: releaseC,
+	}
+
+	mgr := upstream.NewManagerWithTTL(context.Background(), []upstream.Entry{
+		{ID: "test", Prefix: "p", Client: client},
+	}, 5*time.Millisecond)
+	if err := mgr.Warmup(context.Background()); err != nil {
+		t.Fatalf("Warmup: %v", err)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	start := time.Now()
+	result, err := mgr.ToolsCall(context.Background(), &mcp.ToolsCallRequest{Name: "p.tool1"})
+	if err != nil {
+		t.Fatalf("ToolsCall: %v", err)
+	}
+	if result.UpstreamID != "test" {
+		t.Fatalf("upstream id: want test, got %q", result.UpstreamID)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("ToolsCall took too long while refresh blocked: %v", elapsed)
+	}
+	if !mgr.BgRefreshInProgress() {
+		t.Fatal("expected background refresh to be in progress")
+	}
+	close(releaseC)
+}
+
 // ---------------------------------------------------------------------------
-// E6: Initial load runs in background goroutine — first caller not hostage
+// E6: Warmup cancellation and retry behavior
 // ---------------------------------------------------------------------------
 
 // slowClient blocks every ToolsList call until blockCh is closed.
@@ -316,10 +601,8 @@ func (c *slowClient) ToolsCall(_ context.Context, _ *mcp.ToolsCallRequest) (*mcp
 	return nil, fmt.Errorf("not implemented")
 }
 
-// TestFirstCallerContextCancelDoesNotHostageInitialLoad verifies that when
-// the first caller's context is cancelled before the initial load completes,
-// the load continues using the manager's lifecycle context and subsequent
-// callers can still retrieve the cache once it's ready.
+// TestFirstCallerContextCancelDoesNotHostageInitialLoad verifies that a
+// cancelled warmup attempt does not poison subsequent warmup retries.
 func TestFirstCallerContextCancelDoesNotHostageInitialLoad(t *testing.T) {
 	blockCh := make(chan struct{})
 	tools := []mcp.Tool{{Name: "tool1", Description: "d"}}
@@ -332,12 +615,12 @@ func TestFirstCallerContextCancelDoesNotHostageInitialLoad(t *testing.T) {
 		{ID: "test", Prefix: "p", Client: client},
 	}, time.Minute)
 
-	// First caller uses a context that we will cancel to simulate a timeout.
+	// Warmup caller uses a context that we will cancel to simulate a timeout.
 	callerCtx, callerCancel := context.WithCancel(context.Background())
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := mgr.ToolsList(callerCtx)
+		err := mgr.Warmup(callerCtx)
 		errCh <- err
 	}()
 
@@ -356,25 +639,67 @@ func TestFirstCallerContextCancelDoesNotHostageInitialLoad(t *testing.T) {
 		t.Fatal("first caller did not return after context cancel")
 	}
 
-	// Unblock the initial load goroutine (still running on mgrCtx).
+	// Unblock the warmup call.
 	close(blockCh)
 
-	// A new caller should succeed once the load completes.
-	var got []mcp.Tool
+	// A new warmup caller should succeed once the load completes.
 	var err error
 	for i := 0; i < 100; i++ {
-		got, err = mgr.ToolsList(context.Background())
+		err = mgr.Warmup(context.Background())
 		if err == nil {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	if err != nil {
-		t.Fatalf("second caller after load complete: %v", err)
+		t.Fatalf("second warmup after load complete: %v", err)
+	}
+
+	// Calls should now succeed.
+	var got []mcp.Tool
+	got, err = mgr.ToolsList(context.Background())
+	if err != nil {
+		t.Fatalf("ToolsList after warmup: %v", err)
 	}
 	if len(got) != 1 || got[0].Name != "p.tool1" {
 		t.Errorf("unexpected tools: %v", got)
 	}
+}
+
+func TestWarmupRespectsCancellationWithoutHanging(t *testing.T) {
+	blockCh := make(chan struct{})
+	client := &slowClient{
+		tools:   []mcp.Tool{{Name: "tool1", Description: "d"}},
+		blockCh: blockCh,
+	}
+	mgrCtx, mgrCancel := context.WithCancel(context.Background())
+	defer mgrCancel()
+
+	mgr := upstream.NewManagerWithTTL(mgrCtx, []upstream.Entry{
+		{ID: "test", Prefix: "p", Client: client},
+	}, time.Minute)
+
+	warmCtx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- mgr.Warmup(warmCtx)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected Warmup cancellation error")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Warmup did not exit after cancellation")
+	}
+	if mgr.Ready() {
+		t.Fatal("manager must remain unready after canceled warmup")
+	}
+	close(blockCh)
 }
 
 // ---------------------------------------------------------------------------
@@ -419,11 +744,11 @@ func TestBgRefreshFailurePreservesStaleCache(t *testing.T) {
 		{ID: "test", Prefix: "p", Client: client},
 	}, 5*time.Millisecond)
 
-	// Initial load (call 1: succeeds).
-	got, err := mgr.ToolsList(context.Background())
-	if err != nil {
-		t.Fatalf("initial load: %v", err)
+	// Warmup (call 1: succeeds).
+	if err := mgr.Warmup(context.Background()); err != nil {
+		t.Fatalf("Warmup: %v", err)
 	}
+	got, err := mgr.ToolsList(context.Background())
 	if len(got) != 1 {
 		t.Fatalf("want 1 tool, got %d", len(got))
 	}
@@ -454,5 +779,8 @@ func TestBgRefreshFailurePreservesStaleCache(t *testing.T) {
 	}
 	if len(got) != 1 {
 		t.Errorf("after failed refresh: want 1 stale tool, got %d", len(got))
+	}
+	if !mgr.Ready() {
+		t.Fatal("manager must remain ready while stale cache is still usable")
 	}
 }

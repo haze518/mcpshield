@@ -23,6 +23,8 @@ import (
 	"github.com/haze518/mcpshield/pkg/config"
 )
 
+const warmupRetryInterval = 5 * time.Second
+
 func main() {
 	if err := rootCmd().Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -173,6 +175,14 @@ func runServe(ctx context.Context, cfgPath string) error {
 		sessionMaxEntries = *cfg.Server.SessionMaxEntries
 	}
 	gw.SetSessionConfig(sessionTTL, sessionMaxEntries)
+	retryInterval := warmupRetryInterval
+	if cfg.Server.WarmupRetryInterval != "" {
+		d, err := time.ParseDuration(cfg.Server.WarmupRetryInterval)
+		if err != nil {
+			return fmt.Errorf("parse server.warmup_retry_interval: %w", err)
+		}
+		retryInterval = d
+	}
 	log.Info("session cache configured",
 		slog.Duration("ttl", sessionTTL),
 		slog.Int("max_entries", sessionMaxEntries))
@@ -231,6 +241,8 @@ func runServe(ctx context.Context, cfgPath string) error {
 		}
 	}()
 
+	go runWarmupUntilReady(ctx, mgr, retryInterval, log)
+
 	select {
 	case <-ctx.Done():
 		log.Info("shutting down")
@@ -238,6 +250,39 @@ func runServe(ctx context.Context, cfgPath string) error {
 		return srv.Shutdown(context.Background())
 	case err := <-errCh:
 		return fmt.Errorf("server error: %w", err)
+	}
+}
+
+func runWarmupUntilReady(ctx context.Context, mgr interface {
+	Warmup(context.Context) error
+	Ready() bool
+}, retryInterval time.Duration, log *slog.Logger) {
+	if retryInterval <= 0 {
+		retryInterval = warmupRetryInterval
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	for {
+		if mgr.Ready() {
+			return
+		}
+		if err := mgr.Warmup(ctx); err == nil {
+			log.Info("startup warmup completed")
+			return
+		} else if ctx.Err() == nil {
+			log.Warn("startup warmup failed; will retry",
+				slog.String("error", err.Error()),
+				slog.Duration("retry_in", retryInterval))
+		}
+
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
 	}
 }
 
@@ -284,6 +329,9 @@ func runValidateUpstream(ctx context.Context, cfgPath, upstreamID string) error 
 		},
 	})
 
+	if err := mgr.Warmup(ctx); err != nil {
+		return fmt.Errorf("warmup failed: %w", err)
+	}
 	tools, err := mgr.ToolsList(ctx)
 	if err != nil {
 		return fmt.Errorf("tools/list failed: %w", err)

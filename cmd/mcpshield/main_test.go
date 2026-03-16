@@ -3,13 +3,44 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
+	"log/slog"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/haze518/mcpshield/internal/audit"
 	"github.com/haze518/mcpshield/pkg/config"
 )
+
+type warmupTestManager struct {
+	mu       sync.Mutex
+	ready    bool
+	failures int
+	calls    int
+}
+
+func (m *warmupTestManager) Warmup(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls++
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if m.failures > 0 {
+		m.failures--
+		return errors.New("warmup failed")
+	}
+	m.ready = true
+	return nil
+}
+
+func (m *warmupTestManager) Ready() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ready
+}
 
 // ---------------------------------------------------------------------------
 // buildAuth: fail-open prevention
@@ -124,4 +155,54 @@ func TestRunReplayReadOnlyBySession(t *testing.T) {
 	if bytes.Contains(out.Bytes(), []byte("session-2")) {
 		t.Fatalf("did not expect session-2 in output, got %q", out.String())
 	}
+}
+
+func TestRunWarmupUntilReadyRetriesUntilSuccess(t *testing.T) {
+	mgr := &warmupTestManager{failures: 2}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		runWarmupUntilReady(ctx, mgr, 10*time.Millisecond, nilLogger())
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("runWarmupUntilReady did not finish")
+	}
+	if !mgr.Ready() {
+		t.Fatal("manager must be ready after retries succeed")
+	}
+	if mgr.calls < 3 {
+		t.Fatalf("expected at least 3 warmup attempts, got %d", mgr.calls)
+	}
+}
+
+func TestRunWarmupUntilReadyStopsOnCancel(t *testing.T) {
+	mgr := &warmupTestManager{failures: 100}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runWarmupUntilReady(ctx, mgr, 10*time.Millisecond, nilLogger())
+		close(done)
+	}()
+
+	time.Sleep(25 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("runWarmupUntilReady did not stop on cancel")
+	}
+	if mgr.Ready() {
+		t.Fatal("manager must not become ready after cancellation")
+	}
+}
+
+func nilLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(bytes.NewBuffer(nil), nil))
 }

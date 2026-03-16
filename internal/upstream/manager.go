@@ -3,6 +3,7 @@ package upstream
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -19,8 +20,12 @@ func defaultInputSchema() map[string]any {
 	}
 }
 
+var ErrNotReady = errors.New("upstream: not ready")
+
 // Manager proxies MCP tool operations across upstream servers.
 type Manager interface {
+	Warmup(ctx context.Context) error
+	Ready() bool
 	ToolsList(ctx context.Context) ([]mcp.Tool, error)
 	ToolsCall(ctx context.Context, req *mcp.ToolsCallRequest) (*CallResult, error)
 }
@@ -57,6 +62,10 @@ type stubManager struct{}
 func NewStubManager() Manager {
 	return &stubManager{}
 }
+
+func (m *stubManager) Warmup(_ context.Context) error { return nil }
+
+func (m *stubManager) Ready() bool { return true }
 
 func (m *stubManager) ToolsList(_ context.Context) ([]mcp.Tool, error) {
 	return []mcp.Tool{
@@ -121,10 +130,12 @@ type realManager struct {
 	entries  []Entry
 	cacheTTL time.Duration
 
-	mu        sync.Mutex
+	mu sync.Mutex
+	// cached is the single source of truth for readiness: if a usable cache is
+	// present, the manager is ready.
 	cached    *toolsCache
 	loading   chan struct{} // non-nil while first load in progress; closed on completion
-	bgRefresh atomic.Bool  // true while a background cache refresh goroutine is running
+	bgRefresh atomic.Bool   // true while a background cache refresh goroutine is running
 
 	metrics ManagerMetrics // optional; nil = no Prometheus counters
 }
@@ -150,6 +161,51 @@ func (m *realManager) InvalidateCache() {
 	m.mu.Lock()
 	m.cached = nil
 	m.mu.Unlock()
+}
+
+func (m *realManager) Warmup(ctx context.Context) error {
+	m.mu.Lock()
+	if m.cached != nil {
+		m.mu.Unlock()
+		return nil
+	}
+	if m.loading != nil {
+		ch := m.loading
+		m.mu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		m.mu.Lock()
+		ready := m.cached != nil
+		m.mu.Unlock()
+		if ready {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return ErrNotReady
+	}
+	ch := make(chan struct{})
+	m.loading = ch
+	m.mu.Unlock()
+
+	_, err := m.doRefresh(ctx)
+
+	m.mu.Lock()
+	m.loading = nil
+	m.mu.Unlock()
+	close(ch)
+
+	return err
+}
+
+func (m *realManager) Ready() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cached != nil
 }
 
 func (m *realManager) ToolsList(ctx context.Context) ([]mcp.Tool, error) {
@@ -183,15 +239,13 @@ func (m *realManager) ToolsCall(ctx context.Context, req *mcp.ToolsCallRequest) 
 	}, nil
 }
 
-// getCache returns a valid cache without holding mu during network I/O.
+// getCache returns a usable cache without holding mu during network I/O.
 //
-// Three states:
+// Two states:
 //  1. Valid cache (not expired): fast path, returned under lock.
-//  2. No cache yet (first load): serialize via loading channel — first caller
-//     spawns a goroutine using the manager's lifecycle context; subsequent
-//     callers wait without performing extra network I/O.
-//  3. Stale cache: return stale data immediately and trigger one background
+//  2. Stale cache: return old cache immediately and trigger one background
 //     refresh goroutine (guarded by bgRefresh to prevent goroutine accumulation).
+// If no cache exists yet, Warmup must complete first.
 func (m *realManager) getCache(ctx context.Context) (*toolsCache, error) {
 	m.mu.Lock()
 
@@ -221,58 +275,8 @@ func (m *realManager) getCache(ctx context.Context) (*toolsCache, error) {
 		return stale, nil
 	}
 
-	// First-load path: thundering herd prevention via a shared loading channel.
-	// The first goroutine creates the channel and spawns a goroutine using the
-	// manager's lifecycle context (not the first caller's context) so no single
-	// caller is held hostage for the entire initial fetch.
-	if m.loading != nil {
-		ch := m.loading
-		m.mu.Unlock()
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-		m.mu.Lock()
-		c := m.cached
-		m.mu.Unlock()
-		if c == nil {
-			return nil, fmt.Errorf("upstream: initial load failed")
-		}
-		return c, nil
-	}
-
-	// We are the first goroutine: create the loading channel and fetch
-	// in a background goroutine using the server's lifecycle context.
-	ch := make(chan struct{})
-	m.loading = ch
 	m.mu.Unlock()
-
-	go func() {
-		if _, err := m.doRefresh(m.ctx); err != nil && m.ctx.Err() == nil {
-			slog.Default().Warn("upstream initial load failed",
-				slog.String("error", err.Error()))
-		}
-		m.mu.Lock()
-		m.loading = nil
-		m.mu.Unlock()
-		close(ch)
-	}()
-
-	// Wait for the load to complete or the caller's context to expire.
-	select {
-	case <-ch:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-
-	m.mu.Lock()
-	c := m.cached
-	m.mu.Unlock()
-	if c == nil {
-		return nil, fmt.Errorf("upstream: initial load failed")
-	}
-	return c, nil
+	return nil, ErrNotReady
 }
 
 // doRefresh fetches tools from all upstreams and atomically updates the cache.

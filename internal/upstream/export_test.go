@@ -20,3 +20,10 @@ func NewManagerWithTTL(ctx context.Context, entries []Entry, ttl time.Duration) 
 // BgRefreshInProgress reports whether a background cache refresh goroutine
 // is currently running.
 func (m *realManager) BgRefreshInProgress() bool { return m.bgRefresh.Load() }
+
+// LoadingInProgress reports whether initial warmup is currently in flight.
+func (m *realManager) LoadingInProgress() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.loading != nil
+}

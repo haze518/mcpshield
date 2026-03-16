@@ -120,14 +120,24 @@ func httpStatusForCode(code int) int {
 }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Serve Prometheus metrics without the JSON-RPC machinery.
-	if r.Method == http.MethodGet && r.URL.Path == "/metrics" {
-		if g.metrics != nil {
-			g.metrics.Handler().ServeHTTP(w, r)
-		} else {
-			http.NotFound(w, r)
+	// Serve probe/metrics endpoints without the JSON-RPC machinery.
+	if r.Method == http.MethodGet {
+		switch r.URL.Path {
+		case "/metrics":
+			if g.metrics != nil {
+				g.metrics.Handler().ServeHTTP(w, r)
+			} else {
+				http.NotFound(w, r)
+			}
+			return
+		case "/readyz":
+			if g.upstream.Ready() {
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}
+			return
 		}
-		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
@@ -339,14 +349,20 @@ func (g *Gateway) handleToolsList(ctx context.Context, w http.ResponseWriter, re
 	}
 	if err != nil {
 		event.Duration = time.Since(start)
-		event.Error = normalizedError(mcp.CodeServerError, "upstream error", map[string]any{
-			"cause": err.Error(),
-		})
+		msg := "upstream error"
+		status := http.StatusInternalServerError
+		errData := map[string]any{"cause": err.Error()}
+		if errors.Is(err, upstream.ErrNotReady) {
+			msg = "gateway not ready"
+			status = http.StatusServiceUnavailable
+			errData = map[string]any{"reason": "not_ready"}
+		}
+		event.Error = normalizedError(mcp.CodeServerError, msg, errData)
 		if logErr := g.audit.Log(ctx, event); logErr != nil {
 			writeError(w, req.ID, mcp.CodeServerError, "audit logging failed")
 			return
 		}
-		writeError(w, req.ID, mcp.CodeServerError, "upstream error")
+		writeErrorStatus(w, req.ID, status, mcp.CodeServerError, msg)
 		return
 	}
 
@@ -451,14 +467,20 @@ func (g *Gateway) handleToolsCall(ctx context.Context, w http.ResponseWriter, re
 		if callResult != nil && callResult.UpstreamID != "" {
 			event.UpstreamID = callResult.UpstreamID
 		}
-		event.Error = normalizedError(mcp.CodeServerError, "upstream error", map[string]any{
-			"cause": err.Error(),
-		})
+		msg := "upstream error"
+		status := http.StatusInternalServerError
+		errData := map[string]any{"cause": err.Error()}
+		if errors.Is(err, upstream.ErrNotReady) {
+			msg = "gateway not ready"
+			status = http.StatusServiceUnavailable
+			errData = map[string]any{"reason": "not_ready"}
+		}
+		event.Error = normalizedError(mcp.CodeServerError, msg, errData)
 		if logErr := g.audit.Log(ctx, event); logErr != nil {
 			writeError(w, req.ID, mcp.CodeServerError, "audit logging failed")
 			return
 		}
-		writeError(w, req.ID, mcp.CodeServerError, "upstream error")
+		writeErrorStatus(w, req.ID, status, mcp.CodeServerError, msg)
 		return
 	}
 	event.UpstreamID = callResult.UpstreamID
@@ -485,8 +507,12 @@ func writeResult(w http.ResponseWriter, id json.RawMessage, result any) {
 }
 
 func writeError(w http.ResponseWriter, id json.RawMessage, code int, msg string) {
+	writeErrorStatus(w, id, httpStatusForCode(code), code, msg)
+}
+
+func writeErrorStatus(w http.ResponseWriter, id json.RawMessage, status, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(httpStatusForCode(code))
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(mcp.Response{
 		JSONRPC: "2.0",
 		ID:      id,

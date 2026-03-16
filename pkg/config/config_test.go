@@ -96,3 +96,25 @@ policy_file: "session_max_entries is only mentioned here as plain text"
 		t.Fatalf("expected session_max_entries to remain nil, got %v", *cfg.Server.SessionMaxEntries)
 	}
 }
+
+func TestLoadRejectsNonPositiveWarmupRetryInterval(t *testing.T) {
+	path := writeConfig(t, `
+server:
+  listen: ":8080"
+  warmup_retry_interval: "0s"
+`)
+	if _, err := config.Load(path); err == nil {
+		t.Fatal("expected non-positive warmup_retry_interval to fail")
+	}
+}
+
+func TestLoadAcceptsPositiveWarmupRetryInterval(t *testing.T) {
+	path := writeConfig(t, `
+server:
+  listen: ":8080"
+  warmup_retry_interval: "3s"
+`)
+	if _, err := config.Load(path); err != nil {
+		t.Fatalf("expected positive warmup_retry_interval to succeed: %v", err)
+	}
+}

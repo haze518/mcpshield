@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/haze518/mcpshield/internal/auth"
 	"github.com/haze518/mcpshield/internal/gateway"
 	"github.com/haze518/mcpshield/internal/mcp"
+	"github.com/haze518/mcpshield/internal/observability"
 	"github.com/haze518/mcpshield/internal/policy"
 	"github.com/haze518/mcpshield/internal/upstream"
 )
@@ -51,6 +53,30 @@ func (l *failAfterNAuditLogger) Log(_ context.Context, _ *audit.Event) error {
 }
 
 func (l *failAfterNAuditLogger) Close() error { return nil }
+
+type readyManager struct {
+	ready atomic.Bool
+}
+
+func (m *readyManager) Warmup(context.Context) error { m.ready.Store(true); return nil }
+func (m *readyManager) Ready() bool                  { return m.ready.Load() }
+func (m *readyManager) ToolsList(context.Context) ([]mcp.Tool, error) {
+	return []mcp.Tool{}, nil
+}
+func (m *readyManager) ToolsCall(context.Context, *mcp.ToolsCallRequest) (*upstream.CallResult, error) {
+	return &upstream.CallResult{UpstreamID: "test", Result: &mcp.ToolsCallResult{}}, nil
+}
+
+type notReadyManager struct{}
+
+func (m *notReadyManager) Warmup(context.Context) error { return upstream.ErrNotReady }
+func (m *notReadyManager) Ready() bool                  { return false }
+func (m *notReadyManager) ToolsList(context.Context) ([]mcp.Tool, error) {
+	return nil, upstream.ErrNotReady
+}
+func (m *notReadyManager) ToolsCall(context.Context, *mcp.ToolsCallRequest) (*upstream.CallResult, error) {
+	return nil, upstream.ErrNotReady
+}
 
 func (l *testAuditLogger) Log(_ context.Context, event *audit.Event) error {
 	l.mu.Lock()
@@ -91,10 +117,14 @@ type httpResult struct {
 }
 
 func newTestServer(al audit.Logger, eng policy.Engine) *httptest.Server {
+	return newTestServerWithUpstream(al, eng, upstream.NewStubManager())
+}
+
+func newTestServerWithUpstream(al audit.Logger, eng policy.Engine, up upstream.Manager) *httptest.Server {
 	gw := gateway.New(
 		auth.NewAllowAll(),
 		eng,
-		upstream.NewStubManager(),
+		up,
 		al,
 	)
 	return httptest.NewServer(gw)
@@ -350,6 +380,109 @@ func TestUnknownMethodReturns404(t *testing.T) {
 	}
 	if res.rpc.Error == nil || res.rpc.Error.Code != mcp.CodeMethodNotFound {
 		t.Errorf("error code: want %d, got %v", mcp.CodeMethodNotFound, res.rpc.Error)
+	}
+}
+
+func TestReadyzReturns503BeforeWarmup(t *testing.T) {
+	up := &readyManager{}
+	srv := newTestServerWithUpstream(&testAuditLogger{}, policy.NewDenyAllEngine(), up)
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status: want 503, got %d", res.StatusCode)
+	}
+}
+
+func TestReadyzReturns200AfterWarmup(t *testing.T) {
+	up := &readyManager{}
+	if err := up.Warmup(context.Background()); err != nil {
+		t.Fatalf("Warmup: %v", err)
+	}
+	srv := newTestServerWithUpstream(&testAuditLogger{}, policy.NewDenyAllEngine(), up)
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status: want 200, got %d", res.StatusCode)
+	}
+}
+
+func TestMetricsStillWorksIndependentlyOfReadyz(t *testing.T) {
+	up := &readyManager{}
+	gw := gateway.New(auth.NewAllowAll(), policy.NewDenyAllEngine(), up, &testAuditLogger{})
+	gw.SetMetrics(observability.NewRegistry(false))
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	metricsRes, err := http.Get(srv.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer metricsRes.Body.Close()
+	if metricsRes.StatusCode != http.StatusOK {
+		t.Fatalf("/metrics status: want 200, got %d", metricsRes.StatusCode)
+	}
+
+	readyRes, err := http.Get(srv.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readyRes.Body.Close()
+	if readyRes.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz status: want 503, got %d", readyRes.StatusCode)
+	}
+}
+
+func TestToolsListReturns503WhenUpstreamNotReady(t *testing.T) {
+	al := &testAuditLogger{}
+	srv := newTestServerWithUpstream(al, allowAllStubToolsEngine(t), &notReadyManager{})
+	defer srv.Close()
+
+	sessionID := bootstrapSession(t, srv.URL)
+	res := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":42,"method":"tools/list"}`, map[string]string{mcp.SessionHeader: sessionID})
+	if res.status != http.StatusServiceUnavailable {
+		t.Fatalf("status: want 503, got %d", res.status)
+	}
+	if res.rpc.Error == nil || res.rpc.Error.Message != "gateway not ready" {
+		t.Fatalf("expected gateway not ready error, got %+v", res.rpc.Error)
+	}
+	events := al.captured()
+	if len(events) != 2 {
+		t.Fatalf("audit events: want 2, got %d", len(events))
+	}
+	if events[1].Error == nil || events[1].Error.Message != "gateway not ready" {
+		t.Fatalf("expected distinct audit error for not-ready path, got %+v", events[1].Error)
+	}
+}
+
+func TestToolsCallReturns503WhenUpstreamNotReady(t *testing.T) {
+	al := &testAuditLogger{}
+	srv := newTestServerWithUpstream(al, allowAllStubToolsEngine(t), &notReadyManager{})
+	defer srv.Close()
+
+	sessionID := bootstrapSession(t, srv.URL)
+	res := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"filesystem.read_file","arguments":{}}}`, map[string]string{mcp.SessionHeader: sessionID})
+	if res.status != http.StatusServiceUnavailable {
+		t.Fatalf("status: want 503, got %d", res.status)
+	}
+	if res.rpc.Error == nil || res.rpc.Error.Message != "gateway not ready" {
+		t.Fatalf("expected gateway not ready error, got %+v", res.rpc.Error)
+	}
+	events := al.captured()
+	if len(events) != 2 {
+		t.Fatalf("audit events: want 2, got %d", len(events))
+	}
+	if events[1].Error == nil || events[1].Error.Message != "gateway not ready" {
+		t.Fatalf("expected distinct audit error for not-ready path, got %+v", events[1].Error)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -21,6 +22,8 @@ type ServerConfig struct {
 	Listen                 string `yaml:"listen"`
 	MaxRequestBytes        int64  `yaml:"max_request_bytes,omitempty"`
 	InsecureAllowAnonymous bool   `yaml:"insecure_allow_anonymous,omitempty"`
+	SessionTTL             string `yaml:"session_ttl,omitempty"`         // e.g. "30m"
+	SessionMaxEntries      *int   `yaml:"session_max_entries,omitempty"` // e.g. 10000
 }
 
 // ---- auth config --------------------------------------------------------
@@ -119,10 +122,29 @@ func Load(path string) (*Config, error) {
 	if cfg.Server.Listen == "" {
 		cfg.Server.Listen = ":8080"
 	}
+	if err := validateServer(cfg.Server); err != nil {
+		return nil, err
+	}
 	if err := validateUpstreams(cfg.Upstreams); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+func validateServer(server ServerConfig) error {
+	if server.SessionTTL != "" {
+		ttl, err := time.ParseDuration(server.SessionTTL)
+		if err != nil {
+			return fmt.Errorf("server.session_ttl: %w", err)
+		}
+		if ttl <= 0 {
+			return fmt.Errorf("server.session_ttl must be > 0")
+		}
+	}
+	if server.SessionMaxEntries != nil && *server.SessionMaxEntries <= 0 {
+		return fmt.Errorf("server.session_max_entries must be > 0 when set")
+	}
+	return nil
 }
 
 func validateUpstreams(upstreams []UpstreamConfig) error {

@@ -110,12 +110,15 @@ func TestToolsCallRoutesAndStripsPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Content) == 0 {
+	if result.UpstreamID != "fs" {
+		t.Fatalf("want upstream id fs, got %q", result.UpstreamID)
+	}
+	if len(result.Result.Content) == 0 {
 		t.Fatal("expected non-empty content")
 	}
 	// Fake server echoes the name it received; must be stripped of prefix.
-	if result.Content[0].Text != "ok:read_file" {
-		t.Errorf("want ok:read_file (prefix stripped), got %q", result.Content[0].Text)
+	if result.Result.Content[0].Text != "ok:read_file" {
+		t.Errorf("want ok:read_file (prefix stripped), got %q", result.Result.Content[0].Text)
 	}
 }
 

@@ -2,6 +2,8 @@ package mcp
 
 import "encoding/json"
 
+const SessionHeader = "Mcp-Session-Id"
+
 // JSON-RPC 2.0 error codes.
 const (
 	CodeParseError     = -32700

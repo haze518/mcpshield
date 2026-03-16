@@ -7,8 +7,10 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/haze518/mcpshield/internal/audit"
 	"github.com/haze518/mcpshield/internal/auth"
 	"github.com/haze518/mcpshield/internal/mcp"
@@ -23,6 +25,8 @@ const (
 	gatewayName     = "mcpshield"
 	gatewayVersion  = "0.1.0"
 	defaultMaxBody  = 1 << 20 // 1 MiB
+	defaultSessionTTL      = 30 * time.Minute
+	defaultSessionMaxEntries = 10_000
 )
 
 type contextKey string
@@ -36,6 +40,16 @@ type Gateway struct {
 	audit           audit.Logger
 	metrics         *observability.Registry
 	maxRequestBytes int64
+	sessionMu       sync.RWMutex
+	sessionClients  map[string]sessionBinding
+	sessionTTL      time.Duration
+	sessionMaxEntries int
+	timeNow         func() time.Time
+}
+
+type sessionBinding struct {
+	clientID  string
+	expiresAt time.Time
 }
 
 func New(a auth.Authenticator, p policy.Engine, u upstream.Manager, al audit.Logger) *Gateway {
@@ -45,18 +59,44 @@ func New(a auth.Authenticator, p policy.Engine, u upstream.Manager, al audit.Log
 		upstream:        u,
 		audit:           al,
 		maxRequestBytes: defaultMaxBody,
+		sessionClients:  make(map[string]sessionBinding),
+		sessionTTL:      defaultSessionTTL,
+		sessionMaxEntries: defaultSessionMaxEntries,
+		timeNow:         time.Now,
 	}
 }
 
 // SetMetrics wires an optional Prometheus metrics registry into the gateway.
 func (g *Gateway) SetMetrics(r *observability.Registry) {
 	g.metrics = r
+	if r != nil {
+		g.sessionMu.RLock()
+		defer g.sessionMu.RUnlock()
+		r.SetActiveSessions(len(g.sessionClients))
+	}
 }
 
 // SetMaxRequestBytes overrides the default 1 MiB inbound body limit.
 func (g *Gateway) SetMaxRequestBytes(n int64) {
 	if n > 0 {
 		g.maxRequestBytes = n
+	}
+}
+
+// SetSessionConfig overrides the default in-memory session TTL and cap.
+func (g *Gateway) SetSessionConfig(ttl time.Duration, maxEntries int) {
+	if ttl > 0 {
+		g.sessionTTL = ttl
+	}
+	if maxEntries > 0 {
+		g.sessionMaxEntries = maxEntries
+	}
+}
+
+// SetTimeNow overrides the clock used by session lifecycle logic.
+func (g *Gateway) SetTimeNow(now func() time.Time) {
+	if now != nil {
+		g.timeNow = now
 	}
 }
 
@@ -191,25 +231,72 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Notifications (id absent) are acknowledged silently.
 	if isNotification {
+		if req.Method == "notifications/initialized" {
+			requestedSessionID := r.Header.Get(mcp.SessionHeader)
+			if requestedSessionID != "" {
+				sessionID, sessionErr := g.resolveSession(requestedSessionID, clientID)
+				if sessionErr != nil {
+					if logErr := g.logSessionReject(ctx, &req, clientID, requestedSessionID, sessionErr); logErr != nil {
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					w.WriteHeader(httpStatusForCode(sessionErr.code))
+					return
+				}
+				if logErr := g.audit.Log(ctx, &audit.Event{
+						Timestamp:  g.timeNow(),
+						Action:     req.Method,
+						Decision:   "allow",
+						ClientID:   clientID,
+						SessionID:  sessionID,
+						UpstreamID: "gateway",
+					}); logErr != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+			}
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
 	switch req.Method {
 	case "initialize":
-		g.handleInitialize(w, &req)
+		g.handleInitialize(ctx, w, &req, clientID, uuid.NewString())
 	case "tools/list":
-		g.handleToolsList(ctx, w, &req)
+		requestedSessionID := r.Header.Get(mcp.SessionHeader)
+		sessionID, sessionErr := g.resolveSession(requestedSessionID, clientID)
+		if sessionErr != nil {
+			if logErr := g.logSessionReject(ctx, &req, clientID, requestedSessionID, sessionErr); logErr != nil {
+				writeError(w, req.ID, mcp.CodeServerError, "audit logging failed")
+				return
+			}
+			writeError(w, req.ID, sessionErr.code, sessionErr.message)
+			return
+		}
+		w.Header().Set(mcp.SessionHeader, sessionID)
+		g.handleToolsList(ctx, w, &req, clientID, sessionID)
 	case "tools/call":
-		g.handleToolsCall(ctx, w, &req, clientID)
+		requestedSessionID := r.Header.Get(mcp.SessionHeader)
+		sessionID, sessionErr := g.resolveSession(requestedSessionID, clientID)
+		if sessionErr != nil {
+			if logErr := g.logSessionReject(ctx, &req, clientID, requestedSessionID, sessionErr); logErr != nil {
+				writeError(w, req.ID, mcp.CodeServerError, "audit logging failed")
+				return
+			}
+			writeError(w, req.ID, sessionErr.code, sessionErr.message)
+			return
+		}
+		w.Header().Set(mcp.SessionHeader, sessionID)
+		g.handleToolsCall(ctx, w, &req, clientID, sessionID)
 	default:
 		writeError(w, req.ID, mcp.CodeMethodNotFound, "method not found")
 	}
 }
 
 // handleInitialize responds to the MCP initialize handshake.
-func (g *Gateway) handleInitialize(w http.ResponseWriter, req *mcp.Request) {
-	writeResult(w, req.ID, mcp.InitializeResult{
+func (g *Gateway) handleInitialize(ctx context.Context, w http.ResponseWriter, req *mcp.Request, clientID, sessionID string) {
+	result := mcp.InitializeResult{
 		ProtocolVersion: protocolVersion,
 		Capabilities: mcp.ServerCapabilities{
 			Tools: &mcp.ToolsCapability{},
@@ -218,12 +305,47 @@ func (g *Gateway) handleInitialize(w http.ResponseWriter, req *mcp.Request) {
 			Name:    gatewayName,
 			Version: gatewayVersion,
 		},
-	})
+	}
+	event := &audit.Event{
+		Timestamp: g.timeNow(),
+		Action:    "initialize",
+		Decision:  "allow",
+		ClientID:  clientID,
+		RequestID: string(req.ID),
+		SessionID: sessionID,
+		UpstreamID: "gateway",
+		Response:  result,
+	}
+	if logErr := g.audit.Log(ctx, event); logErr != nil {
+		writeError(w, req.ID, mcp.CodeServerError, "audit logging failed")
+		return
+	}
+	g.bindSession(sessionID, clientID)
+	w.Header().Set(mcp.SessionHeader, sessionID)
+	writeResult(w, req.ID, result)
 }
 
-func (g *Gateway) handleToolsList(ctx context.Context, w http.ResponseWriter, req *mcp.Request) {
+func (g *Gateway) handleToolsList(ctx context.Context, w http.ResponseWriter, req *mcp.Request, clientID, sessionID string) {
+	start := time.Now()
 	tools, err := g.upstream.ToolsList(ctx)
+	event := &audit.Event{
+		Timestamp:  g.timeNow(),
+		Action:     "tools/list",
+		Decision:   "allow",
+		ClientID:   clientID,
+		RequestID:  string(req.ID),
+		SessionID:  sessionID,
+		UpstreamID: "gateway",
+	}
 	if err != nil {
+		event.Duration = time.Since(start)
+		event.Error = normalizedError(mcp.CodeServerError, "upstream error", map[string]any{
+			"cause": err.Error(),
+		})
+		if logErr := g.audit.Log(ctx, event); logErr != nil {
+			writeError(w, req.ID, mcp.CodeServerError, "audit logging failed")
+			return
+		}
 		writeError(w, req.ID, mcp.CodeServerError, "upstream error")
 		return
 	}
@@ -234,6 +356,12 @@ func (g *Gateway) handleToolsList(ctx context.Context, w http.ResponseWriter, re
 			allowed = append(allowed, t)
 		}
 	}
+	event.Duration = time.Since(start)
+	event.Response = mcp.ToolsListResult{Tools: allowed}
+	if logErr := g.audit.Log(ctx, event); logErr != nil {
+		writeError(w, req.ID, mcp.CodeServerError, "audit logging failed")
+		return
+	}
 
 	if g.metrics != nil {
 		g.metrics.IncRequest(req.Method, "", "allow")
@@ -241,7 +369,7 @@ func (g *Gateway) handleToolsList(ctx context.Context, w http.ResponseWriter, re
 	writeResult(w, req.ID, mcp.ToolsListResult{Tools: allowed})
 }
 
-func (g *Gateway) handleToolsCall(ctx context.Context, w http.ResponseWriter, req *mcp.Request, clientID string) {
+func (g *Gateway) handleToolsCall(ctx context.Context, w http.ResponseWriter, req *mcp.Request, clientID, sessionID string) {
 	start := time.Now()
 
 	var callReq mcp.ToolsCallRequest
@@ -260,7 +388,7 @@ func (g *Gateway) handleToolsCall(ctx context.Context, w http.ResponseWriter, re
 	decision := g.policy.Evaluate(ctx, &callReq)
 
 	event := &audit.Event{
-		Timestamp:  time.Now(),
+		Timestamp:  g.timeNow(),
 		Action:     "tools/call",
 		Tool:       callReq.Name,
 		Decision:   decision.Action,
@@ -268,18 +396,24 @@ func (g *Gateway) handleToolsCall(ctx context.Context, w http.ResponseWriter, re
 		PolicyRule: decision.Rule,
 		ClientID:   clientID,
 		RequestID:  string(req.ID),
+		SessionID:  sessionID,
+		UpstreamID: "gateway",
 		Arguments:  callReq.Arguments,
 	}
 
 	if decision.Action == "deny" {
 		event.Duration = time.Since(start)
 
-		if logErr := g.audit.Log(ctx, event); logErr != nil {
-			writeError(w, req.ID, mcp.CodeServerError, "audit logging failed")
-			return
-		}
-
 		if decision.RateLimited {
+			event.Error = normalizedError(mcp.CodeRateLimited, "rate limited", map[string]any{
+				"rule":           decision.Rule,
+				"reason":         decision.Reason,
+				"retry_after_ms": decision.RetryAfterMs,
+			})
+			if logErr := g.audit.Log(ctx, event); logErr != nil {
+				writeError(w, req.ID, mcp.CodeServerError, "audit logging failed")
+				return
+			}
 			if g.metrics != nil {
 				g.metrics.IncRateLimitHit(callReq.Name, clientID)
 				g.metrics.IncRequest(req.Method, callReq.Name, "deny")
@@ -292,6 +426,14 @@ func (g *Gateway) handleToolsCall(ctx context.Context, w http.ResponseWriter, re
 			return
 		}
 
+		event.Error = normalizedError(mcp.CodePolicyDenied, "policy denied", map[string]string{
+			"rule":   decision.Rule,
+			"reason": decision.Reason,
+		})
+		if logErr := g.audit.Log(ctx, event); logErr != nil {
+			writeError(w, req.ID, mcp.CodeServerError, "audit logging failed")
+			return
+		}
 		if g.metrics != nil {
 			g.metrics.IncPolicyDeny(decision.Rule)
 			g.metrics.IncRequest(req.Method, callReq.Name, "deny")
@@ -303,10 +445,15 @@ func (g *Gateway) handleToolsCall(ctx context.Context, w http.ResponseWriter, re
 		return
 	}
 
-	result, err := g.upstream.ToolsCall(ctx, &callReq)
+	callResult, err := g.upstream.ToolsCall(ctx, &callReq)
 	event.Duration = time.Since(start)
 	if err != nil {
-		event.Error = err.Error()
+		if callResult != nil && callResult.UpstreamID != "" {
+			event.UpstreamID = callResult.UpstreamID
+		}
+		event.Error = normalizedError(mcp.CodeServerError, "upstream error", map[string]any{
+			"cause": err.Error(),
+		})
 		if logErr := g.audit.Log(ctx, event); logErr != nil {
 			writeError(w, req.ID, mcp.CodeServerError, "audit logging failed")
 			return
@@ -314,6 +461,8 @@ func (g *Gateway) handleToolsCall(ctx context.Context, w http.ResponseWriter, re
 		writeError(w, req.ID, mcp.CodeServerError, "upstream error")
 		return
 	}
+	event.UpstreamID = callResult.UpstreamID
+	event.Response = callResult.Result
 
 	if logErr := g.audit.Log(ctx, event); logErr != nil {
 		writeError(w, req.ID, mcp.CodeServerError, "audit logging failed")
@@ -323,7 +472,7 @@ func (g *Gateway) handleToolsCall(ctx context.Context, w http.ResponseWriter, re
 	if g.metrics != nil {
 		g.metrics.IncRequest(req.Method, callReq.Name, "allow")
 	}
-	writeResult(w, req.ID, result)
+	writeResult(w, req.ID, callResult.Result)
 }
 
 func writeResult(w http.ResponseWriter, id json.RawMessage, result any) {
@@ -353,6 +502,133 @@ func writeErrorWithData(w http.ResponseWriter, id json.RawMessage, code int, msg
 		ID:      id,
 		Error:   &mcp.Error{Code: code, Message: msg, Data: data},
 	})
+}
+
+func normalizedError(code int, msg string, data any) *audit.AuditError {
+	return &audit.AuditError{
+		Code:    code,
+		Message: msg,
+		Data:    data,
+	}
+}
+
+type sessionError struct {
+	code    int
+	message string
+}
+
+func (g *Gateway) resolveSession(requestedSessionID, clientID string) (string, *sessionError) {
+	if requestedSessionID == "" {
+		g.recordSessionReject("missing")
+		return "", &sessionError{code: mcp.CodeInvalidRequest, message: "missing session header"}
+	}
+	boundClientID, ok := g.lookupSessionClient(requestedSessionID)
+	if !ok {
+		g.recordSessionReject("unknown")
+		return "", &sessionError{code: mcp.CodeInvalidRequest, message: "unknown session"}
+	}
+	if boundClientID != clientID {
+		g.recordSessionReject("cross_client")
+		return "", &sessionError{code: mcp.CodeUnauthorized, message: "session does not belong to client"}
+	}
+	return requestedSessionID, nil
+}
+
+func (g *Gateway) bindSession(sessionID, clientID string) {
+	g.sessionMu.Lock()
+	defer g.sessionMu.Unlock()
+	g.evictExpiredLocked(g.timeNow())
+	if len(g.sessionClients) >= g.sessionMaxEntries {
+		g.evictOldestLocked(len(g.sessionClients)-g.sessionMaxEntries+1, "capacity")
+	}
+	g.sessionClients[sessionID] = sessionBinding{
+		clientID:  clientID,
+		expiresAt: g.timeNow().Add(g.sessionTTL),
+	}
+	g.updateActiveSessionsMetricLocked()
+}
+
+func (g *Gateway) lookupSessionClient(sessionID string) (string, bool) {
+	now := g.timeNow()
+	g.sessionMu.Lock()
+	defer g.sessionMu.Unlock()
+	binding, ok := g.sessionClients[sessionID]
+	if !ok {
+		return "", false
+	}
+	if !binding.expiresAt.After(now) {
+		delete(g.sessionClients, sessionID)
+		g.recordSessionEvictionLocked("expired")
+		g.updateActiveSessionsMetricLocked()
+		return "", false
+	}
+	binding.expiresAt = now.Add(g.sessionTTL)
+	g.sessionClients[sessionID] = binding
+	return binding.clientID, true
+}
+
+func (g *Gateway) evictExpiredLocked(now time.Time) {
+	for sessionID, binding := range g.sessionClients {
+		if !binding.expiresAt.After(now) {
+			delete(g.sessionClients, sessionID)
+			g.recordSessionEvictionLocked("expired")
+		}
+	}
+	g.updateActiveSessionsMetricLocked()
+}
+
+func (g *Gateway) evictOldestLocked(n int, reason string) {
+	for range n {
+		var oldestID string
+		var oldest time.Time
+		first := true
+		for sessionID, binding := range g.sessionClients {
+			if first || binding.expiresAt.Before(oldest) {
+				oldestID = sessionID
+				oldest = binding.expiresAt
+				first = false
+			}
+		}
+		if oldestID == "" {
+			return
+		}
+		delete(g.sessionClients, oldestID)
+		g.recordSessionEvictionLocked(reason)
+	}
+	g.updateActiveSessionsMetricLocked()
+}
+
+func (g *Gateway) logSessionReject(ctx context.Context, req *mcp.Request, clientID, requestedSessionID string, sessionErr *sessionError) error {
+	return g.audit.Log(ctx, &audit.Event{
+		Timestamp:  g.timeNow(),
+		Action:     req.Method,
+		Decision:   "deny",
+		ClientID:   clientID,
+		RequestID:  string(req.ID),
+		SessionID:  requestedSessionID,
+		UpstreamID: "gateway",
+		Error: normalizedError(sessionErr.code, sessionErr.message, map[string]any{
+			"requested_session_id": requestedSessionID,
+		}),
+	})
+}
+
+func (g *Gateway) recordSessionReject(reason string) {
+	if g.metrics != nil {
+		g.metrics.IncSessionReject(reason)
+	}
+}
+
+func (g *Gateway) recordSessionEvictionLocked(reason string) {
+	if g.metrics != nil {
+		g.metrics.IncSessionEviction(reason)
+	}
+}
+
+func (g *Gateway) updateActiveSessionsMetricLocked() {
+	if g.metrics != nil {
+		g.metrics.SetActiveSessions(len(g.sessionClients))
+	}
 }
 
 // firstNonSpace returns the first non-whitespace byte in b, or 0 if b is empty/all spaces.

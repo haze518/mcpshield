@@ -1,6 +1,7 @@
 package audit_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -14,6 +15,8 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/haze518/mcpshield/internal/audit"
+	"github.com/haze518/mcpshield/internal/mcp"
+	"github.com/haze518/mcpshield/internal/policy"
 	"github.com/haze518/mcpshield/pkg/config"
 )
 
@@ -166,6 +169,140 @@ func TestSQLiteStoreInsertAndQuery(t *testing.T) {
 	}
 	if got[1].Decision != "deny" {
 		t.Errorf("event[1].Decision: want deny, got %s", got[1].Decision)
+	}
+}
+
+func TestSQLiteStoreScanSessionAndPersistedFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session-fields.db")
+	store, err := audit.NewSQLiteStore(config.AuditSQLiteConfig{Path: path, WAL: true})
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	logger, err := audit.NewTestLoggerWithStore(store, "block", true, 8)
+	if err != nil {
+		t.Fatalf("NewTestLoggerWithStore: %v", err)
+	}
+
+	event := &audit.Event{
+		Timestamp:  time.Now(),
+		Action:     "tools/call",
+		Tool:       "filesystem.read_file",
+		Decision:   "allow",
+		SessionID:  "session-123",
+		UpstreamID: "stub",
+		Arguments:  map[string]any{"path": "/tmp/demo"},
+		Response:   map[string]any{"content": []map[string]any{{"type": "text", "text": "ok"}}},
+		Error:      &audit.AuditError{Code: -32000, Message: "upstream error"},
+	}
+	if err := logger.Log(context.Background(), event); err != nil {
+		t.Fatalf("Log: %v", err)
+	}
+	if err := logger.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	store, err = audit.NewSQLiteStore(config.AuditSQLiteConfig{Path: path, WAL: true})
+	if err != nil {
+		t.Fatalf("re-open store: %v", err)
+	}
+	defer store.Close()
+
+	var got []*audit.StoredEvent
+	if err := store.ScanSession(context.Background(), "session-123", func(e *audit.StoredEvent) error {
+		got = append(got, e)
+		return nil
+	}); err != nil {
+		t.Fatalf("ScanSession: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 event, got %d", len(got))
+	}
+	if got[0].UpstreamID != "stub" {
+		t.Fatalf("upstream_id: want stub, got %q", got[0].UpstreamID)
+	}
+	if got[0].ResponseJSON == "" {
+		t.Fatal("response_json must be persisted")
+	}
+	if got[0].ErrorJSON == "" {
+		t.Fatal("error_json must be persisted")
+	}
+}
+
+func TestReplayReadOnlyFiltersBySession(t *testing.T) {
+	_, store := openStore(t, "replay-session")
+	ctx := context.Background()
+	base := time.Now()
+
+	events := []*audit.StoredEvent{
+		{EventID: "a1", TsUnixNano: base.UnixNano(), SessionID: "session-a", ClientID: "client-a", Method: "initialize", Decision: "allow", UpstreamID: "gateway", EventHash: "h1"},
+		{EventID: "a2", TsUnixNano: base.Add(time.Millisecond).UnixNano(), SessionID: "session-a", ClientID: "client-a", Method: "tools/call", ToolName: "filesystem.read_file", Decision: "allow", UpstreamID: "stub", ResponseJSON: `{"ok":true}`, EventHash: "h2"},
+		{EventID: "b1", TsUnixNano: base.Add(2 * time.Millisecond).UnixNano(), SessionID: "session-b", ClientID: "client-b", Method: "tools/call", ToolName: "github.search_repositories", Decision: "deny", UpstreamID: "gateway", ErrorJSON: `{"message":"denied"}`, EventHash: "h3"},
+	}
+	if err := store.InsertBatch(ctx, events); err != nil {
+		t.Fatalf("InsertBatch: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := audit.ReplayReadOnly(ctx, store, "session-a", &out); err != nil {
+		t.Fatalf("ReplayReadOnly: %v", err)
+	}
+	text := out.String()
+	if !bytes.Contains(out.Bytes(), []byte("session-a")) {
+		t.Fatalf("replay output must contain requested session: %q", text)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("client-a")) {
+		t.Fatalf("replay output must contain client id: %q", text)
+	}
+	if bytes.Contains(out.Bytes(), []byte("session-b")) {
+		t.Fatalf("replay output must not contain other sessions: %q", text)
+	}
+}
+
+func TestReplayPolicyCheckUsesClientIDContext(t *testing.T) {
+	_, store := openStore(t, "replay-policy-client")
+	ctx := context.Background()
+	base := time.Now()
+
+	if err := store.InsertBatch(ctx, []*audit.StoredEvent{
+		{
+			EventID:       "e1",
+			TsUnixNano:    base.UnixNano(),
+			SessionID:     "session-1",
+			ClientID:      "client-1",
+			Method:        "tools/call",
+			ToolName:      "filesystem.read_file",
+			Decision:      "allow",
+			ArgumentsJSON: `{"path":"/tmp/demo"}`,
+			EventHash:     "h1",
+		},
+	}); err != nil {
+		t.Fatalf("InsertBatch: %v", err)
+	}
+
+	compiled, err := policy.LoadFromBytes([]byte(`
+version: "1"
+rules:
+  - name: allow-fs-limited
+    action: allow
+    tools:
+      - filesystem.read_file
+    rate_limit:
+      max: 1
+      window: "60s"
+      per: client
+`))
+	if err != nil {
+		t.Fatalf("LoadFromBytes: %v", err)
+	}
+	eng := policy.NewYAMLPolicyEngineWithOptions(compiled, policy.NewFixedWindowLimiter(), func() time.Time { return base })
+	_ = eng.Evaluate(policy.ContextWithClientID(ctx, "client-1"), &mcp.ToolsCallRequest{Name: "filesystem.read_file"})
+
+	var out bytes.Buffer
+	if err := audit.ReplayPolicyCheck(ctx, store, "session-1", eng, &out); err != nil {
+		t.Fatalf("ReplayPolicyCheck: %v", err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("new=deny")) {
+		t.Fatalf("expected replay to re-evaluate using client context, got %q", out.String())
 	}
 }
 

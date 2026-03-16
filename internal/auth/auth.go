@@ -19,6 +19,8 @@ type Authenticator interface {
 type allowAllAuthenticator struct{}
 
 // NewAllowAll returns an Authenticator that accepts every request.
+// All requests share the synthetic client id "anonymous", so any session or
+// per-client policy isolation is intentionally weak in this demo mode.
 func NewAllowAll() Authenticator {
 	return &allowAllAuthenticator{}
 }

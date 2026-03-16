@@ -22,7 +22,7 @@ func defaultInputSchema() map[string]any {
 // Manager proxies MCP tool operations across upstream servers.
 type Manager interface {
 	ToolsList(ctx context.Context) ([]mcp.Tool, error)
-	ToolsCall(ctx context.Context, req *mcp.ToolsCallRequest) (*mcp.ToolsCallResult, error)
+	ToolsCall(ctx context.Context, req *mcp.ToolsCallRequest) (*CallResult, error)
 }
 
 // ManagerMetrics is implemented by observability.Registry. Accepted by
@@ -35,6 +35,12 @@ type ManagerMetrics interface {
 type Client interface {
 	ToolsList(ctx context.Context) ([]mcp.Tool, error)
 	ToolsCall(ctx context.Context, req *mcp.ToolsCallRequest) (*mcp.ToolsCallResult, error)
+}
+
+// CallResult captures the routed upstream id and the returned MCP payload.
+type CallResult struct {
+	UpstreamID string
+	Result     *mcp.ToolsCallResult
 }
 
 // Entry binds a Client to an id and prefix for aggregation.
@@ -79,14 +85,17 @@ func (m *stubManager) ToolsList(_ context.Context) ([]mcp.Tool, error) {
 	}, nil
 }
 
-func (m *stubManager) ToolsCall(_ context.Context, req *mcp.ToolsCallRequest) (*mcp.ToolsCallResult, error) {
+func (m *stubManager) ToolsCall(_ context.Context, req *mcp.ToolsCallRequest) (*CallResult, error) {
 	argsJSON, err := json.Marshal(req.Arguments)
 	if err != nil {
 		argsJSON = []byte("{}")
 	}
-	return &mcp.ToolsCallResult{
-		Content: []mcp.Content{
-			{Type: "text", Text: fmt.Sprintf("called %s with %s", req.Name, string(argsJSON))},
+	return &CallResult{
+		UpstreamID: "stub",
+		Result: &mcp.ToolsCallResult{
+			Content: []mcp.Content{
+				{Type: "text", Text: fmt.Sprintf("called %s with %s", req.Name, string(argsJSON))},
+			},
 		},
 	}, nil
 }
@@ -96,6 +105,7 @@ func (m *stubManager) ToolsCall(_ context.Context, req *mcp.ToolsCallRequest) (*
 const defaultCacheTTL = 10 * time.Second
 
 type toolRoute struct {
+	upstreamID   string
 	client       Client
 	originalName string
 }
@@ -150,7 +160,7 @@ func (m *realManager) ToolsList(ctx context.Context) ([]mcp.Tool, error) {
 	return c.tools, nil
 }
 
-func (m *realManager) ToolsCall(ctx context.Context, req *mcp.ToolsCallRequest) (*mcp.ToolsCallResult, error) {
+func (m *realManager) ToolsCall(ctx context.Context, req *mcp.ToolsCallRequest) (*CallResult, error) {
 	c, err := m.getCache(ctx)
 	if err != nil {
 		return nil, err
@@ -163,7 +173,14 @@ func (m *realManager) ToolsCall(ctx context.Context, req *mcp.ToolsCallRequest) 
 		Name:      route.originalName,
 		Arguments: req.Arguments,
 	}
-	return route.client.ToolsCall(ctx, upstreamReq)
+	result, err := route.client.ToolsCall(ctx, upstreamReq)
+	if err != nil {
+		return &CallResult{UpstreamID: route.upstreamID}, err
+	}
+	return &CallResult{
+		UpstreamID: route.upstreamID,
+		Result:     result,
+	}, nil
 }
 
 // getCache returns a valid cache without holding mu during network I/O.
@@ -284,6 +301,7 @@ func (m *realManager) doRefresh(ctx context.Context) (*toolsCache, error) {
 				InputSchema: schema,
 			})
 			routeMap[prefixed] = toolRoute{
+				upstreamID:   entry.ID,
 				client:       entry.Client,
 				originalName: t.Name,
 			}

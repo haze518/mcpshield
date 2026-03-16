@@ -13,12 +13,16 @@ import (
 
 // ReplayReadOnly prints a tab-separated timeline for the given session to w:
 //
-//	<ts>  <tool>  <decision>  <policy_rule>  <duration_µs>µs
+//	<ts>  <method>  <session_id>  <client_id>  <tool>  <decision>  <upstream_id>  <duration_µs>µs  <error>
 func ReplayReadOnly(ctx context.Context, store Store, sessionID string, w io.Writer) error {
 	return store.ScanSession(ctx, sessionID, func(e *StoredEvent) error {
 		ts := time.Unix(0, e.TsUnixNano).UTC().Format(time.RFC3339Nano)
-		_, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%dµs\n",
-			ts, e.ToolName, e.Decision, e.PolicyRule, e.DurationUs)
+		hasError := "ok"
+		if e.ErrorJSON != "" {
+			hasError = "error"
+		}
+		_, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%dµs\t%s\n",
+			ts, e.Method, e.SessionID, e.ClientID, e.ToolName, e.Decision, e.UpstreamID, e.DurationUs, hasError)
 		return err
 	})
 }
@@ -45,7 +49,7 @@ func ReplayPolicyCheck(
 		}
 
 		call := &mcp.ToolsCallRequest{Name: e.ToolName, Arguments: args}
-		nd := engine.Evaluate(ctx, call)
+		nd := engine.Evaluate(policy.ContextWithClientID(ctx, e.ClientID), call)
 
 		tag := "="
 		if nd.Action != e.Decision {

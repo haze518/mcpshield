@@ -3,6 +3,7 @@ package gateway_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +28,29 @@ type testAuditLogger struct {
 	mu     sync.Mutex
 	events []*audit.Event
 }
+
+type failingAuditLogger struct{}
+
+func (failingAuditLogger) Log(context.Context, *audit.Event) error { return errors.New("audit failed") }
+func (failingAuditLogger) Close() error                            { return nil }
+
+type failAfterNAuditLogger struct {
+	mu    sync.Mutex
+	count int
+	failAt int
+}
+
+func (l *failAfterNAuditLogger) Log(_ context.Context, _ *audit.Event) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.count++
+	if l.count >= l.failAt {
+		return errors.New("audit failed")
+	}
+	return nil
+}
+
+func (l *failAfterNAuditLogger) Close() error { return nil }
 
 func (l *testAuditLogger) Log(_ context.Context, event *audit.Event) error {
 	l.mu.Lock()
@@ -61,6 +85,7 @@ type rpcResponse struct {
 type httpResult struct {
 	status  int
 	cookies []*http.Cookie
+	headers http.Header
 	rpc     rpcResponse
 	rawBody string
 }
@@ -105,12 +130,19 @@ rules:
 
 // doPost sends a POST and returns HTTP status, cookies, and decoded JSON-RPC.
 func doPost(t *testing.T, url, body string, cookies ...*http.Cookie) httpResult {
+	return doPostHeaders(t, url, body, nil, cookies...)
+}
+
+func doPostHeaders(t *testing.T, url, body string, headers map[string]string, cookies ...*http.Cookie) httpResult {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	for _, c := range cookies {
 		req.AddCookie(c)
 	}
@@ -127,6 +159,7 @@ func doPost(t *testing.T, url, body string, cookies ...*http.Cookie) httpResult 
 	return httpResult{
 		status:  resp.StatusCode,
 		cookies: resp.Cookies(),
+		headers: resp.Header.Clone(),
 		rpc:     rpc,
 		rawBody: string(raw),
 	}
@@ -159,9 +192,36 @@ func doPostAuth(t *testing.T, url, body, token string, cookies ...*http.Cookie) 
 	return httpResult{
 		status:  resp.StatusCode,
 		cookies: resp.Cookies(),
+		headers: resp.Header.Clone(),
 		rpc:     rpc,
 		rawBody: string(raw),
 	}
+}
+
+func bootstrapSession(t *testing.T, url string) string {
+	t.Helper()
+	res := doPost(t, url, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}`)
+	if res.rpc.Error != nil {
+		t.Fatalf("initialize failed: %+v", res.rpc.Error)
+	}
+	sessionID := res.headers.Get(mcp.SessionHeader)
+	if sessionID == "" {
+		t.Fatal("initialize did not return session header")
+	}
+	return sessionID
+}
+
+func bootstrapSessionAuth(t *testing.T, url, token string) string {
+	t.Helper()
+	res := doPostAuth(t, url, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}`, token)
+	if res.rpc.Error != nil {
+		t.Fatalf("initialize failed: %+v", res.rpc.Error)
+	}
+	sessionID := res.headers.Get(mcp.SessionHeader)
+	if sessionID == "" {
+		t.Fatal("initialize did not return session header")
+	}
+	return sessionID
 }
 
 // ---------------------------------------------------------------------------
@@ -341,17 +401,18 @@ rules:
 	al := &testAuditLogger{}
 	srv := newTestServer(al, eng)
 	defer srv.Close()
+	sessionID := bootstrapSession(t, srv.URL)
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"filesystem.read_file","arguments":{}}}`
 
 	// First call: allowed.
-	r1 := doPost(t, srv.URL, body)
+	r1 := doPostHeaders(t, srv.URL, body, map[string]string{mcp.SessionHeader: sessionID})
 	if r1.rpc.Error != nil {
 		t.Fatalf("first call should succeed, got error code=%d", r1.rpc.Error.Code)
 	}
 
 	// Second call: rate limited → 429.
-	r2 := doPost(t, srv.URL, body)
+	r2 := doPostHeaders(t, srv.URL, body, map[string]string{mcp.SessionHeader: sessionID})
 	if r2.status != http.StatusTooManyRequests {
 		t.Errorf("status: want 429, got %d", r2.status)
 	}
@@ -361,7 +422,7 @@ rules:
 }
 
 // ---------------------------------------------------------------------------
-// C) Initialize — no session gate
+// C) Initialize and session bootstrap
 // ---------------------------------------------------------------------------
 
 func TestInitializeReturnsServerInfo(t *testing.T) {
@@ -389,6 +450,330 @@ func TestInitializeReturnsServerInfo(t *testing.T) {
 	}
 	if result.Capabilities.Tools == nil {
 		t.Error("capabilities.tools must be present")
+	}
+}
+
+func TestSessionPropagationAcrossInitializeToolsListAndToolsCall(t *testing.T) {
+	al := &testAuditLogger{}
+	srv := newTestServer(al, allowAllStubToolsEngine(t))
+	defer srv.Close()
+
+	initRes := doPost(t, srv.URL, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}`)
+	if initRes.rpc.Error != nil {
+		t.Fatalf("initialize failed: %+v", initRes.rpc.Error)
+	}
+
+	sessionID := initRes.headers.Get(mcp.SessionHeader)
+	if sessionID == "" {
+		t.Fatal("expected initialize to return session header")
+	}
+
+	listRes := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`, map[string]string{
+		mcp.SessionHeader: sessionID,
+	})
+	if listRes.rpc.Error != nil {
+		t.Fatalf("tools/list failed: %+v", listRes.rpc.Error)
+	}
+	if got := listRes.headers.Get(mcp.SessionHeader); got != sessionID {
+		t.Fatalf("tools/list session header: want %q, got %q", sessionID, got)
+	}
+
+	callRes := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"filesystem.read_file","arguments":{"path":"/tmp/x"}}}`, map[string]string{
+		mcp.SessionHeader: sessionID,
+	})
+	if callRes.rpc.Error != nil {
+		t.Fatalf("tools/call failed: %+v", callRes.rpc.Error)
+	}
+	if got := callRes.headers.Get(mcp.SessionHeader); got != sessionID {
+		t.Fatalf("tools/call session header: want %q, got %q", sessionID, got)
+	}
+
+	events := al.captured()
+	if len(events) != 3 {
+		t.Fatalf("audit events: want 3, got %d", len(events))
+	}
+	for i, evt := range events {
+		if evt.SessionID != sessionID {
+			t.Fatalf("event[%d] session_id: want %q, got %q", i, sessionID, evt.SessionID)
+		}
+		if evt.UpstreamID == "" {
+			t.Fatalf("event[%d] upstream_id must not be empty", i)
+		}
+	}
+	if events[0].Action != "initialize" {
+		t.Fatalf("event[0] action: want initialize, got %s", events[0].Action)
+	}
+	if events[1].Action != "tools/list" {
+		t.Fatalf("event[1] action: want tools/list, got %s", events[1].Action)
+	}
+	if events[2].Action != "tools/call" {
+		t.Fatalf("event[2] action: want tools/call, got %s", events[2].Action)
+	}
+	if events[2].UpstreamID != "stub" {
+		t.Fatalf("tools/call upstream_id: want stub, got %q", events[2].UpstreamID)
+	}
+	if events[2].Response == nil {
+		t.Fatal("tools/call response must be captured in audit event")
+	}
+}
+
+func TestInitializeIgnoresClientProvidedSessionID(t *testing.T) {
+	srv := newTestServer(&testAuditLogger{}, allowAllStubToolsEngine(t))
+	defer srv.Close()
+
+	res := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":1,"method":"initialize"}`, map[string]string{
+		mcp.SessionHeader: "client-forged-session",
+	})
+	if res.rpc.Error != nil {
+		t.Fatalf("initialize failed: %+v", res.rpc.Error)
+	}
+	got := res.headers.Get(mcp.SessionHeader)
+	if got == "" {
+		t.Fatal("expected server-minted session id")
+	}
+	if got == "client-forged-session" {
+		t.Fatal("initialize must not echo client-provided session id")
+	}
+}
+
+func TestInitializeAuditFailureDoesNotPublishSession(t *testing.T) {
+	gw := gateway.New(
+		auth.NewAllowAll(),
+		allowAllStubToolsEngine(t),
+		upstream.NewStubManager(),
+		failingAuditLogger{},
+	)
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	res := doPost(t, srv.URL, `{"jsonrpc":"2.0","id":1,"method":"initialize"}`)
+	if res.status != http.StatusInternalServerError {
+		t.Fatalf("status: want 500, got %d", res.status)
+	}
+	if got := res.headers.Get(mcp.SessionHeader); got != "" {
+		t.Fatalf("failed initialize must not publish session header, got %q", got)
+	}
+}
+
+func TestToolsListRejectsUnknownSession(t *testing.T) {
+	al := &testAuditLogger{}
+	srv := newTestServer(al, allowAllStubToolsEngine(t))
+	defer srv.Close()
+
+	res := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`, map[string]string{
+		mcp.SessionHeader: "forged-session",
+	})
+	if res.status != http.StatusBadRequest {
+		t.Fatalf("status: want 400, got %d", res.status)
+	}
+	if res.rpc.Error == nil || res.rpc.Error.Code != mcp.CodeInvalidRequest {
+		t.Fatalf("error: want invalid request, got %+v", res.rpc.Error)
+	}
+	events := al.captured()
+	if len(events) != 1 {
+		t.Fatalf("audit events: want 1, got %d", len(events))
+	}
+	if events[0].Decision != "deny" || events[0].Action != "tools/list" {
+		t.Fatalf("unexpected audit event: %+v", events[0])
+	}
+}
+
+func TestToolsListRejectsMissingSessionAndAudits(t *testing.T) {
+	al := &testAuditLogger{}
+	srv := newTestServer(al, allowAllStubToolsEngine(t))
+	defer srv.Close()
+
+	res := doPost(t, srv.URL, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+	if res.status != http.StatusBadRequest {
+		t.Fatalf("status: want 400, got %d", res.status)
+	}
+	if res.rpc.Error == nil || res.rpc.Error.Code != mcp.CodeInvalidRequest {
+		t.Fatalf("error: want invalid request, got %+v", res.rpc.Error)
+	}
+	events := al.captured()
+	if len(events) != 1 {
+		t.Fatalf("audit events: want 1, got %d", len(events))
+	}
+	if events[0].SessionID != "" {
+		t.Fatalf("missing-session reject must audit empty session id, got %q", events[0].SessionID)
+	}
+	if events[0].Error == nil || events[0].Error.Message != "missing session header" {
+		t.Fatalf("unexpected audit error: %+v", events[0].Error)
+	}
+}
+
+func TestSessionCannotBeReusedByDifferentClient(t *testing.T) {
+	gw := gateway.New(
+		auth.NewAPIKeyAuthenticator(map[string]string{
+			auth.NewKeyHash("token-a"): "client-a",
+			auth.NewKeyHash("token-b"): "client-b",
+		}),
+		allowAllStubToolsEngine(t),
+		upstream.NewStubManager(),
+		&testAuditLogger{},
+	)
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	initRes := doPostAuth(t, srv.URL, `{"jsonrpc":"2.0","id":1,"method":"initialize"}`, "token-a")
+	if initRes.rpc.Error != nil {
+		t.Fatalf("initialize failed: %+v", initRes.rpc.Error)
+	}
+	sessionID := initRes.headers.Get(mcp.SessionHeader)
+	if sessionID == "" {
+		t.Fatal("expected session id from initialize")
+	}
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL, strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer token-b")
+	req.Header.Set(mcp.SessionHeader, sessionID)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var rpc rpcResponse
+	raw, _ := io.ReadAll(resp.Body)
+	_ = json.Unmarshal(raw, &rpc)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status: want 401, got %d", resp.StatusCode)
+	}
+	if rpc.Error == nil || rpc.Error.Code != mcp.CodeUnauthorized {
+		t.Fatalf("error: want unauthorized, got %+v", rpc.Error)
+	}
+}
+
+func TestInitializedNotificationWithSessionIsAudited(t *testing.T) {
+	al := &testAuditLogger{}
+	srv := newTestServer(al, allowAllStubToolsEngine(t))
+	defer srv.Close()
+
+	sessionID := bootstrapSession(t, srv.URL)
+	res := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","method":"notifications/initialized"}`, map[string]string{
+		mcp.SessionHeader: sessionID,
+	})
+	if res.status != http.StatusNoContent {
+		t.Fatalf("status: want 204, got %d", res.status)
+	}
+	events := al.captured()
+	if len(events) != 2 {
+		t.Fatalf("audit events: want 2, got %d", len(events))
+	}
+	if events[1].Action != "notifications/initialized" {
+		t.Fatalf("expected initialized notification audit, got %s", events[1].Action)
+	}
+}
+
+func TestInitializedNotificationWithInvalidSessionReturnsNon2xxAndAudits(t *testing.T) {
+	al := &testAuditLogger{}
+	srv := newTestServer(al, allowAllStubToolsEngine(t))
+	defer srv.Close()
+
+	res := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","method":"notifications/initialized"}`, map[string]string{
+		mcp.SessionHeader: "forged-session",
+	})
+	if res.status != http.StatusBadRequest {
+		t.Fatalf("status: want 400, got %d", res.status)
+	}
+	if res.rawBody != "" {
+		t.Fatalf("notification reject must not return JSON-RPC body, got %q", res.rawBody)
+	}
+	events := al.captured()
+	if len(events) != 1 {
+		t.Fatalf("audit events: want 1, got %d", len(events))
+	}
+	if events[0].Action != "notifications/initialized" || events[0].Decision != "deny" {
+		t.Fatalf("unexpected audit event: %+v", events[0])
+	}
+}
+
+func TestInitializedNotificationAuditFailureReturnsNon2xxNoBody(t *testing.T) {
+	al := &failAfterNAuditLogger{failAt: 2}
+	gw := gateway.New(auth.NewAllowAll(), allowAllStubToolsEngine(t), upstream.NewStubManager(), al)
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	sessionID := bootstrapSession(t, srv.URL)
+	res := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","method":"notifications/initialized"}`, map[string]string{
+		mcp.SessionHeader: sessionID,
+	})
+	if res.status != http.StatusInternalServerError {
+		t.Fatalf("status: want 500, got %d", res.status)
+	}
+	if res.rawBody != "" {
+		t.Fatalf("notification audit failure must not return body, got %q", res.rawBody)
+	}
+}
+
+func TestSessionExpiresWithoutUse(t *testing.T) {
+	al := &testAuditLogger{}
+	gw := gateway.New(auth.NewAllowAll(), allowAllStubToolsEngine(t), upstream.NewStubManager(), al)
+	now := time.Now()
+	gw.SetTimeNow(func() time.Time { return now })
+	gw.SetSessionConfig(time.Minute, 4)
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	sessionID := bootstrapSession(t, srv.URL)
+	now = now.Add(61 * time.Second)
+
+	res := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`, map[string]string{mcp.SessionHeader: sessionID})
+	if res.status != http.StatusBadRequest {
+		t.Fatalf("status: want 400, got %d", res.status)
+	}
+}
+
+func TestSessionUseRenewsTTL(t *testing.T) {
+	gw := gateway.New(auth.NewAllowAll(), allowAllStubToolsEngine(t), upstream.NewStubManager(), &testAuditLogger{})
+	now := time.Now()
+	gw.SetTimeNow(func() time.Time { return now })
+	gw.SetSessionConfig(time.Minute, 4)
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	sessionID := bootstrapSession(t, srv.URL)
+	now = now.Add(30 * time.Second)
+	res1 := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`, map[string]string{mcp.SessionHeader: sessionID})
+	if res1.rpc.Error != nil {
+		t.Fatalf("first tools/list failed: %+v", res1.rpc.Error)
+	}
+	now = now.Add(59 * time.Second)
+	res2 := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":3,"method":"tools/list"}`, map[string]string{mcp.SessionHeader: sessionID})
+	if res2.rpc.Error != nil {
+		t.Fatalf("renewed session should still be valid: %+v", res2.rpc.Error)
+	}
+}
+
+func TestSessionCapacityEvictsOldest(t *testing.T) {
+	gw := gateway.New(auth.NewAllowAll(), allowAllStubToolsEngine(t), upstream.NewStubManager(), &testAuditLogger{})
+	now := time.Now()
+	gw.SetTimeNow(func() time.Time { return now })
+	gw.SetSessionConfig(time.Hour, 2)
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	s1 := bootstrapSession(t, srv.URL)
+	now = now.Add(time.Second)
+	s2 := bootstrapSession(t, srv.URL)
+	now = now.Add(time.Second)
+	s3 := bootstrapSession(t, srv.URL)
+
+	resOld := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`, map[string]string{mcp.SessionHeader: s1})
+	if resOld.status != http.StatusBadRequest {
+		t.Fatalf("oldest session should be evicted, got status %d", resOld.status)
+	}
+	res2 := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":3,"method":"tools/list"}`, map[string]string{mcp.SessionHeader: s2})
+	if res2.rpc.Error != nil {
+		t.Fatalf("second session should remain valid: %+v", res2.rpc.Error)
+	}
+	res3 := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":4,"method":"tools/list"}`, map[string]string{mcp.SessionHeader: s3})
+	if res3.rpc.Error != nil {
+		t.Fatalf("newest session should remain valid: %+v", res3.rpc.Error)
 	}
 }
 
@@ -459,8 +844,9 @@ func TestRequestBodyTooLarge(t *testing.T) {
 func TestToolsListReturnsTwoTools(t *testing.T) {
 	srv := newTestServer(&testAuditLogger{}, allowAllStubToolsEngine(t))
 	defer srv.Close()
+	sessionID := bootstrapSession(t, srv.URL)
 
-	res := doPost(t, srv.URL, `{"jsonrpc":"2.0","id":42,"method":"tools/list"}`)
+	res := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":42,"method":"tools/list"}`, map[string]string{mcp.SessionHeader: sessionID})
 
 	if res.rpc.Error != nil {
 		t.Fatalf("unexpected error: code=%d msg=%s", res.rpc.Error.Code, res.rpc.Error.Message)
@@ -482,8 +868,9 @@ func TestToolsCallDeniedByPolicy(t *testing.T) {
 	al := &testAuditLogger{}
 	srv := newTestServer(al, policy.NewDenyAllEngine())
 	defer srv.Close()
+	sessionID := bootstrapSession(t, srv.URL)
 
-	res := doPost(t, srv.URL, `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"filesystem.read_file","arguments":{}}}`)
+	res := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"filesystem.read_file","arguments":{}}}`, map[string]string{mcp.SessionHeader: sessionID})
 
 	if res.rpc.Error == nil {
 		t.Fatal("expected error response, got nil")
@@ -493,11 +880,11 @@ func TestToolsCallDeniedByPolicy(t *testing.T) {
 	}
 
 	events := al.captured()
-	if len(events) != 1 {
-		t.Fatalf("audit events: want 1, got %d", len(events))
+	if len(events) != 2 {
+		t.Fatalf("audit events: want 2, got %d", len(events))
 	}
-	if events[0].Decision != "deny" {
-		t.Errorf("audit decision: want deny, got %s", events[0].Decision)
+	if events[1].Decision != "deny" {
+		t.Errorf("audit decision: want deny, got %s", events[1].Decision)
 	}
 }
 
@@ -516,8 +903,9 @@ rules:
 
 	srv := newTestServer(&testAuditLogger{}, policy.NewYAMLPolicyEngine(p))
 	defer srv.Close()
+	sessionID := bootstrapSession(t, srv.URL)
 
-	res := doPost(t, srv.URL, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	res := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`, map[string]string{mcp.SessionHeader: sessionID})
 	if res.rpc.Error != nil {
 		t.Fatalf("unexpected error: code=%d msg=%s", res.rpc.Error.Code, res.rpc.Error.Message)
 	}
@@ -537,8 +925,9 @@ rules:
 func TestToolsListWithDenyAllReturnsNoTools(t *testing.T) {
 	srv := newTestServer(&testAuditLogger{}, policy.NewDenyAllEngine())
 	defer srv.Close()
+	sessionID := bootstrapSession(t, srv.URL)
 
-	res := doPost(t, srv.URL, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	res := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`, map[string]string{mcp.SessionHeader: sessionID})
 	if res.rpc.Error != nil {
 		t.Fatalf("unexpected error: code=%d msg=%s", res.rpc.Error.Code, res.rpc.Error.Message)
 	}
@@ -579,8 +968,9 @@ rules:
 	al := &testAuditLogger{}
 	srv := newTestServer(al, policy.NewYAMLPolicyEngine(p))
 	defer srv.Close()
+	sessionID := bootstrapSession(t, srv.URL)
 
-	res := doPost(t, srv.URL, `{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"filesystem.read_file","arguments":{"path":"/etc/passwd"}}}`)
+	res := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"filesystem.read_file","arguments":{"path":"/etc/passwd"}}}`, map[string]string{mcp.SessionHeader: sessionID})
 
 	if res.rpc.Error == nil {
 		t.Fatal("expected policy denied error, got nil")
@@ -604,11 +994,11 @@ rules:
 	}
 
 	events := al.captured()
-	if len(events) != 1 {
-		t.Fatalf("audit events: want 1, got %d", len(events))
+	if len(events) != 2 {
+		t.Fatalf("audit events: want 2, got %d", len(events))
 	}
-	if events[0].Decision != "deny" {
-		t.Errorf("audit decision: want deny, got %s", events[0].Decision)
+	if events[1].Decision != "deny" {
+		t.Errorf("audit decision: want deny, got %s", events[1].Decision)
 	}
 }
 
@@ -639,17 +1029,18 @@ rules:
 	al := &testAuditLogger{}
 	srv := newTestServer(al, eng)
 	defer srv.Close()
+	sessionID := bootstrapSession(t, srv.URL)
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"filesystem.read_file","arguments":{}}}`
 
 	// First call: allowed.
-	r1 := doPost(t, srv.URL, body)
+	r1 := doPostHeaders(t, srv.URL, body, map[string]string{mcp.SessionHeader: sessionID})
 	if r1.rpc.Error != nil {
 		t.Fatalf("first call should succeed, got error code=%d msg=%s", r1.rpc.Error.Code, r1.rpc.Error.Message)
 	}
 
 	// Second call: rate limited.
-	r2 := doPost(t, srv.URL, body)
+	r2 := doPostHeaders(t, srv.URL, body, map[string]string{mcp.SessionHeader: sessionID})
 	if r2.rpc.Error == nil {
 		t.Fatal("expected rate-limit error, got nil")
 	}
@@ -696,8 +1087,9 @@ rules:
 
 	srv := newTestServer(&testAuditLogger{}, policy.NewYAMLPolicyEngine(p))
 	defer srv.Close()
+	sessionID := bootstrapSession(t, srv.URL)
 
-	res := doPost(t, srv.URL, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"filesystem.read_file","arguments":{"path":"/home/user/doc.txt"}}}`)
+	res := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"filesystem.read_file","arguments":{"path":"/home/user/doc.txt"}}}`, map[string]string{mcp.SessionHeader: sessionID})
 
 	if res.rpc.Error != nil {
 		t.Errorf("expected success for safe path, got error code=%d msg=%s", res.rpc.Error.Code, res.rpc.Error.Message)
@@ -742,7 +1134,11 @@ func TestAPIKeyAuthAcceptsValidToken(t *testing.T) {
 	srv := httptest.NewServer(gw)
 	defer srv.Close()
 
-	res := doPostAuth(t, srv.URL, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`, rawToken)
+	sessionID := bootstrapSessionAuth(t, srv.URL, rawToken)
+	res := doPostHeaders(t, srv.URL, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`, map[string]string{
+		"Authorization":   "Bearer " + rawToken,
+		mcp.SessionHeader: sessionID,
+	})
 
 	if res.rpc.Error != nil {
 		t.Fatalf("unexpected error: code=%d msg=%s", res.rpc.Error.Code, res.rpc.Error.Message)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -158,6 +159,24 @@ func runServe(ctx context.Context, cfgPath string) error {
 		mgr,
 		auditLog,
 	)
+
+	sessionTTL := 30 * time.Minute
+	if cfg.Server.SessionTTL != "" {
+		ttl, err := time.ParseDuration(cfg.Server.SessionTTL)
+		if err != nil {
+			return fmt.Errorf("parse server.session_ttl: %w", err)
+		}
+		sessionTTL = ttl
+	}
+	sessionMaxEntries := 10_000
+	if cfg.Server.SessionMaxEntries != nil {
+		sessionMaxEntries = *cfg.Server.SessionMaxEntries
+	}
+	gw.SetSessionConfig(sessionTTL, sessionMaxEntries)
+	log.Info("session cache configured",
+		slog.Duration("ttl", sessionTTL),
+		slog.Int("max_entries", sessionMaxEntries))
+	log.Info("HTTP session cache is in-memory; process restart requires clients to re-initialize")
 
 	if cfg.Server.MaxRequestBytes > 0 {
 		gw.SetMaxRequestBytes(cfg.Server.MaxRequestBytes)
@@ -395,6 +414,10 @@ func replayCmd() *cobra.Command {
 }
 
 func runReplay(ctx context.Context, dbPath, sessionID, mode, policyFile string) error {
+	return runReplayTo(ctx, dbPath, sessionID, mode, policyFile, os.Stdout)
+}
+
+func runReplayTo(ctx context.Context, dbPath, sessionID, mode, policyFile string, w io.Writer) error {
 	store, err := audit.NewSQLiteStore(config.AuditSQLiteConfig{Path: dbPath})
 	if err != nil {
 		return fmt.Errorf("open audit db: %w", err)
@@ -403,7 +426,7 @@ func runReplay(ctx context.Context, dbPath, sessionID, mode, policyFile string) 
 
 	switch mode {
 	case "read-only":
-		return audit.ReplayReadOnly(ctx, store, sessionID, os.Stdout)
+		return audit.ReplayReadOnly(ctx, store, sessionID, w)
 	case "policy-check":
 		if policyFile == "" {
 			return errors.New("--policy is required for policy-check mode")
@@ -413,7 +436,7 @@ func runReplay(ctx context.Context, dbPath, sessionID, mode, policyFile string) 
 			return fmt.Errorf("load policy: %w", err)
 		}
 		eng := policy.NewYAMLPolicyEngine(compiled)
-		return audit.ReplayPolicyCheck(ctx, store, sessionID, eng, os.Stdout)
+		return audit.ReplayPolicyCheck(ctx, store, sessionID, eng, w)
 	default:
 		return fmt.Errorf("unknown --mode %q (want read-only or policy-check)", mode)
 	}

@@ -20,6 +20,8 @@ var (
 	ErrUnknownSqliteWriteMode = errors.New("audit: unknown sqlite write mode")
 )
 
+const CodeAuditMarshalFailure = -32099
+
 // Event is the application-level audit record created by the gateway.
 type Event struct {
 	// Core identity — populated by gateway.
@@ -32,7 +34,7 @@ type Event struct {
 	ClientID   string
 	RequestID  string
 	Duration   time.Duration
-	Error      string
+	Error      *AuditError
 
 	// Extended fields — set when available.
 	EventID    uuid.UUID
@@ -42,6 +44,13 @@ type Event struct {
 	UpstreamID string
 	Arguments  map[string]any // serialised to arguments_json
 	Response   any            // serialised to response_json
+}
+
+// AuditError is the normalized persisted error shape for audit records.
+type AuditError struct {
+	Code    int `json:"code"`
+	Message string `json:"message"`
+	Data    any `json:"data,omitempty"`
 }
 
 // AuditMetrics is implemented by observability.Registry. It is accepted by
@@ -514,9 +523,15 @@ func eventToStored(e *Event) *StoredEvent {
 		}
 	}
 	errJSON := ""
-	if e.Error != "" {
-		if b, err := json.Marshal(map[string]string{"message": e.Error}); err == nil {
+	if e.Error != nil {
+		if b, err := json.Marshal(e.Error); err == nil {
 			errJSON = string(b)
+		} else if fb, fbErr := json.Marshal(&AuditError{
+			Code:    CodeAuditMarshalFailure,
+			Message: "failed to marshal audit error",
+			Data:    map[string]any{"cause": err.Error()},
+		}); fbErr == nil {
+			errJSON = string(fb)
 		}
 	}
 	return &StoredEvent{

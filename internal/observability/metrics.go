@@ -25,6 +25,9 @@ type Registry struct {
 	upstreamProtocolErrors   *prometheus.CounterVec
 	upstreamResponseTooLarge *prometheus.CounterVec
 	toolsRefreshFail         *prometheus.CounterVec
+	activeSessions           prometheus.Gauge
+	sessionRejects           *prometheus.CounterVec
+	sessionEvictions         *prometheus.CounterVec
 	includeClientID          bool
 }
 
@@ -102,11 +105,34 @@ func NewRegistry(includeClientID bool) *Registry {
 		[]string{"upstream_id"},
 	)
 
+	activeSessions := prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "mcpshield_active_sessions",
+			Help: "Current number of live MCP HTTP sessions in the gateway cache.",
+		},
+	)
+
+	sessionRejects := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "mcpshield_session_rejects_total",
+			Help: "Total rejected session validations.",
+		},
+		[]string{"reason"},
+	)
+
+	sessionEvictions := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "mcpshield_session_evictions_total",
+			Help: "Total expired or capacity-driven session evictions.",
+		},
+		[]string{"reason"},
+	)
+
 	reg.MustRegister(
 		requests, rateLimitHits, policyDenies,
 		auditDropped, auditWriteFail,
 		upstreamProtocolErrors, upstreamResponseTooLarge,
-		toolsRefreshFail,
+		toolsRefreshFail, activeSessions, sessionRejects, sessionEvictions,
 	)
 
 	return &Registry{
@@ -119,6 +145,9 @@ func NewRegistry(includeClientID bool) *Registry {
 		upstreamProtocolErrors:   upstreamProtocolErrors,
 		upstreamResponseTooLarge: upstreamResponseTooLarge,
 		toolsRefreshFail:         toolsRefreshFail,
+		activeSessions:           activeSessions,
+		sessionRejects:           sessionRejects,
+		sessionEvictions:         sessionEvictions,
 		includeClientID:          includeClientID,
 	}
 }
@@ -165,6 +194,21 @@ func (r *Registry) IncUpstreamResponseTooLarge(upstreamID string) {
 // IncToolsRefreshFail increments mcpshield_tools_refresh_fail_total{upstream_id}.
 func (r *Registry) IncToolsRefreshFail(upstreamID string) {
 	r.toolsRefreshFail.WithLabelValues(upstreamID).Inc()
+}
+
+// SetActiveSessions sets mcpshield_active_sessions.
+func (r *Registry) SetActiveSessions(n int) {
+	r.activeSessions.Set(float64(n))
+}
+
+// IncSessionReject increments mcpshield_session_rejects_total{reason}.
+func (r *Registry) IncSessionReject(reason string) {
+	r.sessionRejects.WithLabelValues(reason).Inc()
+}
+
+// IncSessionEviction increments mcpshield_session_evictions_total{reason}.
+func (r *Registry) IncSessionEviction(reason string) {
+	r.sessionEvictions.WithLabelValues(reason).Inc()
 }
 
 // Handler returns an http.Handler that serves metrics in Prometheus text format.
